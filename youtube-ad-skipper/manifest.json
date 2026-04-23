@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Ad Auto-Skipper",
+  "version": "2.0.0",
+  "description": "Automatically skips, mutes, and fast-forwards YouTube ads. Shows a badge count of ads skipped.",
+  "permissions": [],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "YouTube Ad Auto-Skipper"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
