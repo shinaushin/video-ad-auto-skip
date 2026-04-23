@@ -28,7 +28,12 @@
     ".ytp-ad-skip-button-modern",
     "button.ytp-ad-skip-button",
     ".ytp-ad-skip-button-slot button",
+    ".ytp-ad-skip-button-slot",
     'button[id^="skip-button"]',
+    ".videoAdUiSkipButton",
+    'button[data-id="skip-button"]',
+    ".ytp-ad-skip-button-container button",
+    ".ytp-ad-skip-button-container",
   ];
 
   // Overlay / banner close buttons
@@ -104,16 +109,28 @@
     return SKIP_TEXT_PATTERNS.some((pat) => pat.test(text));
   }
 
-  /** Check if a DOM element is visible and clickable. */
+  /**
+   * Check if a DOM element is visible and clickable.
+   *
+   * NOTE: We intentionally do NOT use `offsetParent` here. YouTube's
+   * skip button lives inside a fixed-position overlay, and
+   * `offsetParent` returns null for elements inside `position: fixed`
+   * containers — causing every skip button to look "invisible."
+   * Instead we use `getBoundingClientRect()` which works regardless
+   * of positioning mode.
+   */
   function isClickable(el) {
     if (!el) return false;
     if (el.disabled) return false;
-    if (el.offsetParent === null) return false;
 
     const style = window.getComputedStyle(el);
-    return style.display !== "none" &&
-           style.visibility !== "hidden" &&
-           style.opacity !== "0";
+    if (style.display === "none") return false;
+    if (style.visibility === "hidden") return false;
+    if (style.opacity === "0") return false;
+
+    // Check that the element has real dimensions on screen
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
   }
 
   /** Notify the background service worker that we skipped an ad. */
@@ -174,6 +191,21 @@
   }
 
   /**
+   * Aggressively click an element using multiple strategies.
+   * Some YouTube buttons swallow simple .click() calls, so we also
+   * dispatch a full pointer-event sequence.
+   */
+  function forceClick(el) {
+    // Strategy 1: plain click
+    el.click();
+
+    // Strategy 2: dispatch a real mouse-event sequence
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    }
+  }
+
+  /**
    * Try to find and click any visible skip button.
    * Uses both class-based selectors and text-based heuristics.
    * Returns true if a button was clicked.
@@ -183,8 +215,17 @@
     const classButtons = document.querySelectorAll(COMBINED_SKIP_SELECTOR);
     for (const btn of classButtons) {
       if (isClickable(btn)) {
-        btn.click();
-        console.log("[Ad Skipper] Skipped ad (class selector).");
+        forceClick(btn);
+        console.log("[Ad Skipper] Skipped ad (class selector):", btn.className || btn.id);
+        notifySkipped();
+        return true;
+      }
+      // Some containers aren't clickable themselves but have a
+      // clickable child button — try those too
+      const inner = btn.querySelector("button, [role='button'], span[role='button']");
+      if (inner && isClickable(inner)) {
+        forceClick(inner);
+        console.log("[Ad Skipper] Skipped ad (inner button):", inner.className || inner.id);
         notifySkipped();
         return true;
       }
@@ -194,12 +235,12 @@
     //    text matches known skip patterns. This survives YouTube renaming
     //    CSS classes.
     const allButtons = document.querySelectorAll(
-      "button, [role='button'], .ytp-ad-skip-button-slot *"
+      "button, [role='button'], .ytp-ad-skip-button-slot *, .ytp-ad-module *"
     );
     for (const btn of allButtons) {
       if (isClickable(btn) && looksLikeSkipButton(btn)) {
-        btn.click();
-        console.log("[Ad Skipper] Skipped ad (text heuristic).");
+        forceClick(btn);
+        console.log("[Ad Skipper] Skipped ad (text heuristic):", btn.textContent.trim());
         notifySkipped();
         return true;
       }
@@ -216,7 +257,7 @@
     const buttons = document.querySelectorAll(COMBINED_OVERLAY_SELECTOR);
     for (const btn of buttons) {
       if (isClickable(btn)) {
-        btn.click();
+        forceClick(btn);
         console.log("[Ad Skipper] Closed overlay ad.");
         notifySkipped();
       }
@@ -337,5 +378,5 @@
     characterData: true,
   });
 
-  console.log("[Ad Skipper] YouTube Ad Auto-Skipper v2.0 is active.");
+  console.log("[Ad Skipper] YouTube Ad Auto-Skipper v2.1 is active.");
 })();
