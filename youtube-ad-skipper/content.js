@@ -287,6 +287,11 @@
 
   // ─── Main loop ────────────────────────────────────────────────────
 
+  /**
+   * Main tick — called by MutationObserver and setInterval.
+   * Detects ad state, attempts skip/mute/speedup, and handles
+   * double-ad stacks and post-ad cleanup.
+   */
   function tick() {
     const adPlaying = isAdPlaying();
 

@@ -1,0 +1,13 @@
+{
+  "name": "sponsor-speeder-benchmark",
+  "version": "1.0.0",
+  "description": "Benchmark sponsor detection accuracy against SponsorBlock ground truth",
+  "main": "benchmark.js",
+  "scripts": {
+    "test": "node benchmark.js",
+    "test:popular": "node benchmark.js --popular 20"
+  },
+  "dependencies": {
+    "xmldom": "^0.6.0"
+  }
+}
