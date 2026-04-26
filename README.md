@@ -73,13 +73,13 @@ Measures sponsor detection accuracy against [SponsorBlock's](https://sponsor.aja
 cd youtube-sponsor-speeder/test
 
 # Sample 50 random videos from the full SponsorBlock database
-node benchmark.js --db
+python3 benchmark.py --db
 
 # Sample 500 videos with 5 parallel caption fetches, less output
-node benchmark.js --db --sample 500 --concurrency 5 --quiet
+python3 benchmark.py --db --sample 500 --workers 5 --quiet
 
 # Go big
-node benchmark.js --db --sample 2000 --concurrency 10 --quiet
+python3 benchmark.py --db --sample 2000 --workers 10 --quiet
 ```
 
 This downloads `sponsorTimes.csv` (~2-4 GB) from SponsorBlock's public mirrors and caches it locally in `.cache/`. It parses all rows, filters for high-confidence segments (votes ≥ 3, not hidden, videos over 60s), randomly samples N videos, fetches their YouTube captions, runs our detection, and compares.
@@ -87,7 +87,7 @@ This downloads `sponsorTimes.csv` (~2-4 GB) from SponsorBlock's public mirrors a
 **API mode** — test specific videos:
 
 ```bash
-node benchmark.js VIDEO_ID1 VIDEO_ID2 VIDEO_ID3
+python3 benchmark.py VIDEO_ID1 VIDEO_ID2 VIDEO_ID3
 ```
 
 **Options:**
@@ -96,7 +96,7 @@ node benchmark.js VIDEO_ID1 VIDEO_ID2 VIDEO_ID3
 |------|---------|-------------|
 | `--db` | off | Use full SponsorBlock database instead of per-video API |
 | `--sample N` | 50 | Number of videos to sample in database mode |
-| `--concurrency N` | 3 | Parallel YouTube caption fetches |
+| `--workers N` | 3 | Parallel YouTube caption fetches |
 | `--quiet` | off | One-line-per-video output instead of detailed breakdown |
 
 **Metrics reported:**
@@ -108,7 +108,7 @@ node benchmark.js VIDEO_ID1 VIDEO_ID2 VIDEO_ID3
 
 Results are saved to `benchmark-results.json` for further analysis.
 
-**Requirements:** Node.js 18+. Zero npm dependencies.
+**Requirements:** Python 3.7+. Zero pip dependencies (stdlib only).
 
 ---
 
