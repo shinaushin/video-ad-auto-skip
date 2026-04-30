@@ -1,6 +1,6 @@
 # Video Ad Auto-Skip
 
-Two Chrome extensions for handling YouTube ads, plus a benchmark suite for measuring detection accuracy.
+Three Chrome extensions for handling YouTube ads, plus a benchmark suite for measuring detection accuracy.
 
 ## Extensions
 
@@ -172,3 +172,85 @@ Both extensions have tunable constants at the top of their `content.js` files. T
 **Sponsor Speeder — AV mode:** This is a best-effort fallback. It catches sponsor reads with visually distinct content (product shots, screen recordings, branded graphics) but cannot detect the common "creator just keeps talking to camera" style. It also consumes more CPU than transcript mode due to continuous canvas draws and Web Audio processing.
 
 **Mobile / Smart TV:** These are Chrome desktop extensions. They do not work on the YouTube mobile app or smart TV apps. See the note in the repo about network-level alternatives like Pi-hole.
+
+---
+
+### 3. YouTube ML Sponsor Detector (`youtube-ml-sponsor-detector/`)
+
+An experimental alternative to the Sponsor Speeder that uses a **bimodal ML model** — combining keyword text features and MFCC audio features — instead of pattern matching and heuristic thresholds. Designed as a testable implementation of the project plan's student model architecture, runnable immediately via built-in calibrated weights and upgradeable to a trained ONNX model once training is complete.
+
+**What it does:**
+
+- Detects in-video sponsor segments using a two-stage pipeline (text pre-detection + real-time bimodal inference)
+- When confidence > 0.85 and the segment end is known: **seeks** the video directly past the end — instantaneous skip, no fast-forwarding
+- Falls back to 16× speedthrough only when a segment end time isn't available (real-time-only detection with no pre-detected boundaries)
+- Shows a purple indicator top-left ("⏭ Skipped (ML 87% · heuristic)") — distinct from the Sponsor Speeder's orange indicator, so both can run side-by-side for A/B comparison
+- Upgrades to a trained ONNX model by dropping `model.onnx` + `ort.min.js` into the folder
+
+**How it works:**
+
+The detection pipeline runs in two stages per video:
+
+*Stage 1 — Upfront text pre-detection:* Fetches the caption timed-text XML, groups cues into 5-second windows, and extracts a 64-dimensional keyword indicator vector for each window. Each of the 64 dimensions corresponds to a specific regex pattern covering sponsor intro phrases (group 0, weighted 3×), call-to-action language (group 1, 1.5×), offer/discount language (group 2, 1.5×), and product endorsement language (group 3, 0.5×). The keyword vector is fed to the ML model with zeroed audio features. Windows scoring above a relaxed pre-detection threshold are merged into candidate segments.
+
+*Stage 2 — Real-time bimodal inference:* Every second, the MFCC extractor captures one frame from the Web Audio API's AnalyserNode. The pipeline applies a mel filterbank (26 triangular bands, 80–8000 Hz) to the FFT power spectrum, computes log mel energies, then DCT-II → 13 MFCC coefficients. The coefficients are mean-subtracted against a 60-second rolling baseline (delta-MFCCs), capturing *changes* in the acoustic environment rather than absolute values. The 64-dim text vector and 13-dim MFCC vector are concatenated and passed through the MLP. The final score is a 75/25 blend of the ML score and a cosine-distance audio anomaly score.
+
+**The MLP architecture (student model):** `[77 → 32 → 16 → 1]` with ReLU activations and sigmoid output. Layer 1 neurons are grouped by feature type: intro-phrase neurons (0–7), CTA neurons (8–15), offer neurons (16–23), product-language neurons (24–27), and audio-anomaly neurons (28–31). Layer 2 neurons detect combinations: intro-phrase alone (high score), CTA+offer co-occurrence (high score), audio anomaly alone (moderate), and audio+product reinforcement. The built-in heuristic weights produce scores > 0.65 for "sponsored by" + any CTA, and > 0.5 for a clear audio shift.
+
+**Two inference backends:**
+
+| Backend | When used | Accuracy |
+|---------|-----------|----------|
+| Built-in heuristic MLP | Always (no setup needed) | Pattern-match quality — good baseline |
+| ONNX Runtime Web | When `model.onnx` + `ort.min.js` present | Trained model quality |
+
+**Files:**
+
+| File | Purpose |
+|------|---------|
+| `manifest.json` | Manifest V3 config; lists `feature-extractor.js`, `ml-detector.js`, `content.js` |
+| `feature-extractor.js` | `KeywordFeatureExtractor` (64-dim keyword vector) + `MFCCExtractor` (13-dim MFCC + anomaly score) |
+| `ml-detector.js` | `MLSponsorDetector` — MLP inference engine with ONNX path and heuristic fallback |
+| `content.js` | Two-stage detection pipeline, playback control, on-screen indicator |
+| `model.onnx` | *(not included — drop in after training)* Trained student model |
+| `ort.min.js` | *(not included — download separately)* ONNX Runtime Web |
+
+**Plugging in the trained ONNX model:**
+
+Once training on the SponsorBlock dataset is complete (see project plan, Phases 1–4):
+
+1. Export the student model: `torch.onnx.export(student, dummy_input, "model.onnx", input_names=["input"], output_names=["output"])`
+2. Download `ort.min.js` from `https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js`
+3. Copy both files into `youtube-ml-sponsor-detector/`
+4. Add `"ort.min.js"` to `content_scripts` in `manifest.json` *before* `feature-extractor.js`
+5. Reload the extension — the indicator will show "ONNX" instead of "heuristic"
+
+**Expected input to the ONNX model:** a single float32 tensor of shape `[1, 77]` — the first 64 values are the keyword indicator vector, the last 13 are the mean-pooled delta-MFCC vector.
+
+---
+
+## Configuration (ML Sponsor Detector)
+
+Constants in `youtube-ml-sponsor-detector/content.js`:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `SEEK_BUFFER` | `1.0` | Seconds added after segment end before seeking (landing buffer) |
+| `SPEED_FALLBACK` | `16` | Playback speed used in fallback speed mode (no known segment end) |
+| `POLL_MS` | `1000` | Real-time inference poll interval (ms) |
+| `WINDOW_SEC` | `5` | Caption window size for text features (seconds) |
+| `PAD_BEFORE` | `1.5` | Seconds of padding before detected segment |
+| `PAD_AFTER` | `2.0` | Seconds of padding after detected segment |
+| `ML_WEIGHT` | `0.75` | Weight of ML score in the blended real-time score |
+| `AUDIO_WEIGHT` | `0.25` | Weight of raw audio anomaly in the blended score |
+| `PRE_DETECT_BOOST` | `0.85` | Entry threshold multiplier inside a pre-detected region |
+
+Constants in `youtube-ml-sponsor-detector/ml-detector.js`:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `ENTRY_THRESHOLD` | `0.85` | Minimum blended score to seek/speed through a segment |
+| `EXIT_THRESHOLD` | `0.50` | Score must fall below this (with 0 consecutive frames) to exit speed mode |
+| `MIN_CONSECUTIVE_FRAMES` | `2` | Consecutive frames required above threshold before triggering |
+
+**Relationship to the existing Sponsor Speeder:** The two extensions are fully independent and can run simultaneously — useful for comparing detection results on the same video. The ML Detector uses a purple top-left indicator; the Sponsor Speeder uses an orange top-right indicator. Both use the same `video.playbackRate` mechanism but maintain separate state.

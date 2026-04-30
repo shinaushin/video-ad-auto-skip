@@ -1,0 +1,11 @@
+{
+  "name": "yt-sponsor-phase5-export",
+  "phase": "export",
+  "description": "Export trained student model to ONNX with two-input interface (text_input + audio_input).",
+  "student_ckpt": "/kaggle/working/outputs/student_best.pt",
+  "output_dir": "/kaggle/working/outputs",
+  "onnx_filename": "model.onnx",
+  "n_frames": 30,
+  "opset": 17,
+  "validate": true
+}

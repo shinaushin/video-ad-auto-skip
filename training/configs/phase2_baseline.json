@@ -1,0 +1,8 @@
+{
+  "name": "yt-sponsor-phase2-baseline",
+  "phase": "baseline",
+  "description": "Evaluate keyword heuristic accuracy against SponsorBlock ground truth labels.",
+  "cache_dir": "/kaggle/working/embeddings_cache",
+  "output_dir": "/kaggle/working/outputs",
+  "seed": 42
+}

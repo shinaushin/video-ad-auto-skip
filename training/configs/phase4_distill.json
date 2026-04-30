@@ -1,0 +1,19 @@
+{
+  "name": "yt-sponsor-phase4-distill",
+  "phase": "distill",
+  "description": "Train student model (keyword CNN + MLP) via knowledge distillation from teacher.",
+  "cache_dir": "/kaggle/working/embeddings_cache",
+  "teacher_ckpt": "/kaggle/working/outputs/teacher_best.pt",
+  "output_dir": "/kaggle/working/outputs",
+  "epochs": 30,
+  "batch_size": 64,
+  "lr": 1e-3,
+  "weight_decay": 1e-4,
+  "patience": 5,
+  "kd_temperature": 4.0,
+  "kd_alpha": 0.7,
+  "focal_gamma": 2.0,
+  "focal_alpha": 0.25,
+  "device": "auto",
+  "seed": 42
+}
