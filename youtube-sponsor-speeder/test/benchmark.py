@@ -221,7 +221,7 @@ def http_get_json(url: str, timeout: int = 30):
 # YouTube InnerTube API client configs, tried in order.
 # TVHTML5 bypasses consent walls and age-gates most reliably.
 # ANDROID is a robust fallback. WEB is last as it's most bot-detected.
-INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+# Note: the ?key= parameter was removed — it is deprecated and optional.
 INNERTUBE_CLIENTS = [
     {
         "clientName": "TVHTML5",
@@ -237,6 +237,31 @@ INNERTUBE_CLIENTS = [
         "clientVersion": "2.20250401.00.00",
     },
 ]
+
+
+def _caption_cache_path(video_id: str) -> Path:
+    return CAPTION_CACHE_DIR / f"{video_id}.json"
+
+
+def _load_caption_cache(video_id: str) -> list[dict] | None:
+    p = _caption_cache_path(video_id)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        # None sentinel means we previously confirmed no captions available
+        if data is None:
+            return []          # empty list → caller treats as no_captions
+        return data or None
+    except Exception:
+        return None
+
+
+def _save_caption_cache(video_id: str, cues: list[dict] | None):
+    CAPTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    p = _caption_cache_path(video_id)
+    # Store None as JSON null so we don't re-fetch videos with no captions
+    p.write_text(json.dumps(cues))
 
 
 def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | None:
@@ -260,6 +285,12 @@ def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | N
         if debug:
             print(f"    [captions] {msg}")
 
+    # Check cache first
+    cached = _load_caption_cache(video_id)
+    if cached is not None:
+        dbg(f"cache hit — {len(cached)} cues" if cached else "cache hit — no captions")
+        return cached if cached else None
+
     # Strategy 1: InnerTube API
     dbg("trying InnerTube API...")
     base_url = _get_caption_url_innertube(video_id)
@@ -276,6 +307,7 @@ def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | N
             cues = _parse_caption_xml(raw) or _parse_caption_json(raw)
             if cues:
                 dbg(f"success — {len(cues)} cues")
+                _save_caption_cache(video_id, cues)
                 return cues
             dbg(f"URL fetched {len(raw)} bytes but parsed 0 cues")
         else:
@@ -286,6 +318,7 @@ def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | N
     cues = _get_captions_via_html_session(video_id)
     if cues:
         dbg(f"cookie session success — {len(cues)} cues")
+        _save_caption_cache(video_id, cues)
         return cues
     dbg("cookie session returned no cues")
 
@@ -296,11 +329,14 @@ def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | N
         cues = _get_captions_via_ytdlp(video_id)
         if cues:
             dbg(f"yt-dlp success — {len(cues)} cues")
+            _save_caption_cache(video_id, cues)
             return cues
         dbg("yt-dlp returned no cues (check: does the video have captions on YouTube?)")
     else:
         dbg("yt-dlp not found in PATH — skipping (install with: pip install yt-dlp)")
 
+    # Cache the negative result so we don't retry this video on future runs
+    _save_caption_cache(video_id, None)
     return None
 
 
@@ -516,7 +552,7 @@ def _get_caption_url_innertube(video_id: str) -> str | None:
     Tries multiple client configs in order — TVHTML5 is most reliable
     for bypassing consent walls and bot detection.
     """
-    api_url = f"https://www.youtube.com/youtubei/v1/player?key={INNERTUBE_API_KEY}"
+    api_url = "https://www.youtube.com/youtubei/v1/player"
     for client in INNERTUBE_CLIENTS:
         try:
             payload = {
@@ -609,6 +645,7 @@ def get_sponsorblock_segments(video_id: str) -> list[dict]:
 
 CACHE_DIR = Path(__file__).parent / ".cache"
 CACHE_FILE = CACHE_DIR / "sponsorTimes.csv"
+CAPTION_CACHE_DIR = CACHE_DIR / "captions"
 
 DB_MIRRORS = [
     "https://sb.ltn.fi/database/sponsorTimes.csv",
@@ -673,7 +710,7 @@ def download_file(url: str, dest: Path):
     print()
 
 
-def parse_database(csv_path: Path, sample_size: int = 50) -> list[dict]:
+def parse_database(csv_path: Path, sample_size: int | None = 50) -> list[dict]:
     """
     Parse sponsorTimes.csv and extract high-confidence sponsor segments.
 
@@ -769,8 +806,9 @@ def parse_database(csv_path: Path, sample_size: int = 50) -> list[dict]:
     print(f"High-confidence videos (votes >= 3): {len(high_confidence):,}")
 
     random.shuffle(high_confidence)
-    sample = high_confidence[:sample_size]
-    print(f"Sampled {len(sample)} videos for benchmarking\n")
+    sample = high_confidence if sample_size is None else high_confidence[:sample_size]
+    label = "all" if sample_size is None else str(len(sample))
+    print(f"Sampled {label} videos for benchmarking\n")
     return sample
 
 
@@ -931,19 +969,26 @@ def main():
     parser.add_argument("--db", action="store_true",
                         help="Use full SponsorBlock database (~2-4 GB, cached)")
     parser.add_argument("--sample", type=int, default=50,
-                        help="Videos to sample in DB mode (default: 50)")
+                        help="Videos to sample in DB mode (default: 50); "
+                             "use 0 to process all qualifying videos")
     parser.add_argument("--workers", type=int, default=3,
                         help="Parallel caption fetches (default: 3)")
     parser.add_argument("--quiet", action="store_true",
                         help="One-line-per-video output")
+    parser.add_argument("--prefetch", action="store_true",
+                        help="Download and cache captions for all DB videos without "
+                             "running detection. Re-run without --prefetch to benchmark "
+                             "instantly from cache. Safe to interrupt and resume.")
     args = parser.parse_args()
 
     if not args.db and not args.video_ids:
         parser.print_help()
         print("\nExamples:")
-        print("  python3 benchmark.py --db                   # sample 50 from full database")
-        print("  python3 benchmark.py --db --sample 500      # sample 500 videos")
-        print("  python3 benchmark.py VIDEO_ID1 VIDEO_ID2    # test specific videos")
+        print("  python3 benchmark.py --db                        # sample 50 from full database")
+        print("  python3 benchmark.py --db --sample 500           # sample 500 videos")
+        print("  python3 benchmark.py --db --sample 0 --prefetch  # cache ALL video captions")
+        print("  python3 benchmark.py --db --sample 0             # benchmark all (needs cache)")
+        print("  python3 benchmark.py VIDEO_ID1 VIDEO_ID2         # test specific videos")
         sys.exit(0)
 
     print("YouTube Sponsor Speeder — Detection Benchmark")
@@ -954,7 +999,8 @@ def main():
 
     if args.db:
         csv_path = ensure_database()
-        test_cases = parse_database(csv_path, args.sample)
+        sample_size = args.sample if args.sample > 0 else None   # None = all
+        test_cases = parse_database(csv_path, sample_size)
     else:
         for vid in args.video_ids:
             try:
@@ -962,6 +1008,36 @@ def main():
                 test_cases.append({"videoId": vid, "segments": segments})
             except Exception as e:
                 print(f"  Warning: Could not fetch SponsorBlock data for {vid}: {e}")
+
+    # ── Prefetch mode: download captions for all videos, skip detection ──
+    if args.prefetch:
+        cached_count = sum(1 for tc in test_cases
+                           if _caption_cache_path(tc["videoId"]).exists())
+        remaining = len(test_cases) - cached_count
+        print(f"Prefetch mode: {len(test_cases):,} videos  "
+              f"({cached_count:,} already cached, {remaining:,} to fetch)")
+        print(f"Using {args.workers} worker(s). Safe to interrupt — resumes from cache.\n")
+
+        completed = 0
+        def fetch_one(tc):
+            vid = tc["videoId"]
+            if _caption_cache_path(vid).exists():
+                return vid, "cached"
+            cues = get_captions_for_video(vid)
+            return vid, f"{len(cues)} cues" if cues else "no captions"
+
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(fetch_one, tc): tc for tc in test_cases}
+            for future in as_completed(futures):
+                vid, status = future.result()
+                completed += 1
+                if completed % 100 == 0 or completed == len(test_cases):
+                    pct = completed / len(test_cases) * 100
+                    print(f"  [{completed:,}/{len(test_cases):,}  {pct:.1f}%]  {vid} — {status}")
+                elif not args.quiet:
+                    print(f"  {vid} — {status}")
+        print(f"\nDone. Cached captions in: {CAPTION_CACHE_DIR}")
+        return
 
     print(f"Testing {len(test_cases)} video(s) with {args.workers} worker(s)...\n")
 

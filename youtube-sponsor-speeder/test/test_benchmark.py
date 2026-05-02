@@ -383,11 +383,25 @@ class TestParseCaptionJson(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════
 
 class TestGetCaptionsForVideo(unittest.TestCase):
+    """
+    Cache is always patched out so tests are isolated from disk state.
+    _load_caption_cache returns None (cache miss) and _save_caption_cache is a no-op.
+    """
+
+    def _no_cache(self):
+        """Return a context manager that bypasses the caption cache."""
+        return patch.multiple(
+            bm,
+            _load_caption_cache=lambda vid: None,
+            _save_caption_cache=lambda vid, cues: None,
+        )
 
     def test_returns_none_when_all_strategies_fail(self):
-        with patch.object(bm, "_get_caption_url_innertube", return_value=None), \
+        with self._no_cache(), \
+             patch.object(bm, "_get_caption_url_innertube", return_value=None), \
              patch.object(bm, "_get_caption_url_html", return_value=None), \
-             patch.object(bm, "_get_captions_via_html_session", return_value=None):
+             patch.object(bm, "_get_captions_via_html_session", return_value=None), \
+             patch.object(bm, "_get_captions_via_ytdlp", return_value=None):
             result = bm.get_captions_for_video("dummyId")
             self.assertIsNone(result)
 
@@ -396,9 +410,11 @@ class TestGetCaptionsForVideo(unittest.TestCase):
   <text start="1.0" dur="2.0">Brought to you by Acme</text>
   <text start="3.0" dur="2.0">Go to acme.com now</text>
 </transcript>"""
-        with patch.object(bm, "_get_caption_url_innertube", return_value="https://fake.url/xml"), \
+        with self._no_cache(), \
+             patch.object(bm, "_get_caption_url_innertube", return_value="https://fake.url/xml"), \
              patch.object(bm, "_get_caption_url_html", return_value=None), \
              patch.object(bm, "_get_captions_via_html_session", return_value=None), \
+             patch.object(bm, "_get_captions_via_ytdlp", return_value=None), \
              patch.object(bm, "http_get", return_value=xml):
             result = bm.get_captions_for_video("dummyId")
         self.assertIsNotNone(result)
@@ -406,30 +422,54 @@ class TestGetCaptionsForVideo(unittest.TestCase):
 
     def test_falls_back_to_html_url_strategy(self):
         xml = "<transcript><text start='0' dur='2'>Hello</text></transcript>"
-        with patch.object(bm, "_get_caption_url_innertube", return_value=None), \
+        with self._no_cache(), \
+             patch.object(bm, "_get_caption_url_innertube", return_value=None), \
              patch.object(bm, "_get_caption_url_html", return_value="https://fake.url/html"), \
              patch.object(bm, "_get_captions_via_html_session", return_value=None), \
+             patch.object(bm, "_get_captions_via_ytdlp", return_value=None), \
              patch.object(bm, "http_get", return_value=xml):
             result = bm.get_captions_for_video("dummyId")
         self.assertIsNotNone(result)
         self.assertEqual(result[0]["text"], "Hello")
 
     def test_falls_back_to_cookie_session_when_url_fetch_empty(self):
-        # URL strategies return a URL but fetch gives empty body —
-        # cookie session fallback should then be tried.
         cookie_cues = [{"start": 1.0, "dur": 2.0, "text": "From cookie session"}]
-        with patch.object(bm, "_get_caption_url_innertube", return_value="https://fake.url"), \
+        with self._no_cache(), \
+             patch.object(bm, "_get_caption_url_innertube", return_value="https://fake.url"), \
              patch.object(bm, "_get_caption_url_html", return_value=None), \
              patch.object(bm, "http_get", return_value=""), \
-             patch.object(bm, "_get_captions_via_html_session", return_value=cookie_cues):
+             patch.object(bm, "_get_captions_via_html_session", return_value=cookie_cues), \
+             patch.object(bm, "_get_captions_via_ytdlp", return_value=None):
             result = bm.get_captions_for_video("dummyId")
         self.assertEqual(result, cookie_cues)
 
+    def test_falls_back_to_ytdlp_when_all_else_fails(self):
+        import shutil
+        ytdlp_cues = [{"start": 5.0, "dur": 3.0, "text": "From yt-dlp"}]
+        with self._no_cache(), \
+             patch.object(bm, "_get_caption_url_innertube", return_value=None), \
+             patch.object(bm, "_get_caption_url_html", return_value=None), \
+             patch.object(bm, "_get_captions_via_html_session", return_value=None), \
+             patch.object(bm, "_get_captions_via_ytdlp", return_value=ytdlp_cues), \
+             patch.object(shutil, "which", return_value="/usr/bin/yt-dlp"):
+            result = bm.get_captions_for_video("dummyId")
+        self.assertEqual(result, ytdlp_cues)
+
+    def test_cache_hit_skips_all_strategies(self):
+        cached = [{"start": 0.0, "dur": 2.0, "text": "Cached cue"}]
+        with patch.object(bm, "_load_caption_cache", return_value=cached), \
+             patch.object(bm, "_get_caption_url_innertube") as mock_innertube:
+            result = bm.get_captions_for_video("dummyId")
+        self.assertEqual(result, cached)
+        mock_innertube.assert_not_called()
+
     def test_returns_none_on_empty_raw_and_no_session_fallback(self):
-        with patch.object(bm, "_get_caption_url_innertube", return_value="https://fake.url"), \
+        with self._no_cache(), \
+             patch.object(bm, "_get_caption_url_innertube", return_value="https://fake.url"), \
              patch.object(bm, "_get_caption_url_html", return_value=None), \
              patch.object(bm, "http_get", return_value=""), \
-             patch.object(bm, "_get_captions_via_html_session", return_value=None):
+             patch.object(bm, "_get_captions_via_html_session", return_value=None), \
+             patch.object(bm, "_get_captions_via_ytdlp", return_value=None):
             result = bm.get_captions_for_video("dummyId")
         self.assertIsNone(result)
 

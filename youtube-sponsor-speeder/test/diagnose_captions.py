@@ -18,8 +18,6 @@ BROWSER_UA = (
 )
 HEADERS = {"User-Agent": BROWSER_UA}
 
-INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-
 INNERTUBE_CLIENTS = [
     {"clientName": "TVHTML5",  "clientVersion": "7.20240201.16.00"},
     {"clientName": "ANDROID",  "clientVersion": "19.09.37", "androidSdkVersion": 30},
@@ -39,7 +37,7 @@ def post_json(url, body):
 
 
 def check_innertube(video_id):
-    api_url = f"https://www.youtube.com/youtubei/v1/player?key={INNERTUBE_API_KEY}"
+    api_url = "https://www.youtube.com/youtubei/v1/player"
     for client in INNERTUBE_CLIENTS:
         name = client["clientName"]
         try:
