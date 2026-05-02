@@ -610,75 +610,61 @@ def _get_captions_via_ytdlp(
                 ] + auth_args
 
                 url = f"https://www.youtube.com/watch?v={video_id}"
+                cmd = base_cmd + ["--sub-langs", "en", url]
 
-                # Pass 1: English captions only (en covers en, en-US, en-GB, etc.)
-                # Pass 2: any language — many SponsorBlock videos are non-English
-                #         but still have English-language sponsor reads.
-                for lang_filter in (["--sub-langs", "en"], []):
-                    cmd = base_cmd + lang_filter + [url]
-                    proc = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=60,
-                        check=False,
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+
+                stdout = getattr(proc, "stdout", "") or ""
+                stderr = getattr(proc, "stderr", "") or ""
+                combined = (stdout + stderr).lower()
+
+                # Rate-limit → retry with back-off
+                if "http error 429" in combined or "too many requests" in combined:
+                    wait = 10 * (2 ** attempt)
+                    time.sleep(wait)
+                    continue
+
+                # Permanent errors → raise immediately
+                if "sign in to confirm" in combined or "bot" in combined:
+                    raise YtdlpError("bot-blocked")
+                if "private video" in combined:
+                    raise YtdlpError("private")
+                if "video unavailable" in combined or "not available" in combined:
+                    raise YtdlpError("unavailable")
+                if "has been removed" in combined:
+                    raise YtdlpError("deleted")
+                if proc.returncode != 0 and combined.strip():
+                    first_err = next(
+                        (ln.strip() for ln in (stdout + stderr).splitlines() if ln.strip()),
+                        "unknown error",
                     )
+                    raise YtdlpError(first_err[:80])
 
-                    stdout = getattr(proc, "stdout", "") or ""
-                    stderr = getattr(proc, "stderr", "") or ""
-                    combined = (stdout + stderr).lower()
+                for filename in sorted(_os.listdir(tmpdir)):
+                    filepath = _os.path.join(tmpdir, filename)
+                    try:
+                        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                            content = fh.read()
+                    except Exception:
+                        continue
+                    if not content.strip():
+                        continue
+                    if filename.endswith(".vtt"):
+                        cues = _parse_caption_vtt(content)
+                    elif filename.endswith((".srv3", ".json3")):
+                        cues = _parse_caption_json(content)
+                    else:
+                        cues = _parse_caption_xml(content) or _parse_caption_json(content)
+                    if cues:
+                        return cues
 
-                    # Rate-limit → retry outer loop with back-off
-                    if "http error 429" in combined or "too many requests" in combined:
-                        wait = 10 * (2 ** attempt)
-                        time.sleep(wait)
-                        break  # break inner lang loop, retry outer attempt loop
-
-                    # Permanent errors → raise immediately
-                    if "sign in to confirm" in combined or "bot" in combined:
-                        raise YtdlpError("bot-blocked")
-                    if "private video" in combined:
-                        raise YtdlpError("private")
-                    if "video unavailable" in combined or "not available" in combined:
-                        raise YtdlpError("unavailable")
-                    if "has been removed" in combined:
-                        raise YtdlpError("deleted")
-                    if proc.returncode != 0 and combined.strip():
-                        first_err = next(
-                            (ln.strip() for ln in (stdout + stderr).splitlines() if ln.strip()),
-                            "unknown error",
-                        )
-                        raise YtdlpError(first_err[:80])
-
-                    # Parse any subtitle files written to tmpdir
-                    cues = None
-                    for filename in sorted(_os.listdir(tmpdir)):
-                        filepath = _os.path.join(tmpdir, filename)
-                        try:
-                            with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-                                content = fh.read()
-                        except Exception:
-                            continue
-                        if not content.strip():
-                            continue
-                        if filename.endswith(".vtt"):
-                            cues = _parse_caption_vtt(content)
-                        elif filename.endswith((".srv3", ".json3")):
-                            cues = _parse_caption_json(content)
-                        else:
-                            cues = _parse_caption_xml(content) or _parse_caption_json(content)
-                        if cues:
-                            return cues
-
-                    if cues is not None:
-                        # Parse succeeded but returned empty — no point trying all-lang
-                        break
-                    # else: no files written for this lang filter → try next pass
-
-                else:
-                    pass  # both passes ran without rate-limit break
-
-                return None  # yt-dlp ran cleanly but found no captions in any language
+                return None  # yt-dlp ran cleanly but found no English captions
 
         except YtdlpError:
             raise  # propagate to caller
