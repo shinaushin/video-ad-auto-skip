@@ -593,73 +593,92 @@ def _get_captions_via_ytdlp(
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 out_tmpl = _os.path.join(tmpdir, "%(id)s.%(ext)s")
-                cmd = [
+                auth_args = []
+                if cookies_from_browser:
+                    auth_args = ["--cookies-from-browser", cookies_from_browser]
+                elif cookies_file:
+                    auth_args = ["--cookies", cookies_file]
+
+                base_cmd = [
                     "yt-dlp",
-                    "--write-subs",       # manual (human) captions
-                    "--write-auto-subs",  # auto-generated captions
-                    "--sub-langs", "en.*",
+                    "--write-subs",
+                    "--write-auto-subs",
                     "--skip-download",
                     "--no-playlist",
-                    "--no-warnings",      # suppress banner/progress but keep errors
+                    "--no-warnings",
                     "-o", out_tmpl,
-                ]
-                if cookies_from_browser:
-                    cmd += ["--cookies-from-browser", cookies_from_browser]
-                elif cookies_file:
-                    cmd += ["--cookies", cookies_file]
-                cmd.append(f"https://www.youtube.com/watch?v={video_id}")
+                ] + auth_args
 
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                    check=False,
-                )
+                url = f"https://www.youtube.com/watch?v={video_id}"
 
-                stdout = getattr(proc, "stdout", "") or ""
-                stderr = getattr(proc, "stderr", "") or ""
-                combined = (stdout + stderr).lower()
-
-                # Detect rate-limiting → retry with exponential back-off
-                if "http error 429" in combined or "too many requests" in combined:
-                    wait = 10 * (2 ** attempt)  # 10 s, 20 s, 40 s
-                    time.sleep(wait)
-                    continue
-
-                # Detect permanent errors → raise so caller can log the reason
-                if "sign in to confirm" in combined or "bot" in combined:
-                    raise YtdlpError("bot-blocked")
-                if "private video" in combined:
-                    raise YtdlpError("private")
-                if "video unavailable" in combined or "not available" in combined:
-                    raise YtdlpError("unavailable")
-                if "has been removed" in combined:
-                    raise YtdlpError("deleted")
-                if proc.returncode != 0 and combined.strip():
-                    # Surface first non-empty stderr line for unknown errors
-                    first_err = next(
-                        (ln.strip() for ln in (stdout + stderr).splitlines() if ln.strip()),
-                        "unknown error",
+                # Pass 1: English captions only (en covers en, en-US, en-GB, etc.)
+                # Pass 2: any language — many SponsorBlock videos are non-English
+                #         but still have English-language sponsor reads.
+                for lang_filter in (["--sub-langs", "en"], []):
+                    cmd = base_cmd + lang_filter + [url]
+                    proc = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
                     )
-                    raise YtdlpError(first_err[:80])
 
-                for filename in _os.listdir(tmpdir):
-                    filepath = _os.path.join(tmpdir, filename)
-                    with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-                        content = fh.read()
-                    if not content.strip():
-                        continue
-                    if filename.endswith(".vtt"):
-                        cues = _parse_caption_vtt(content)
-                    elif filename.endswith(".srv3"):
-                        cues = _parse_caption_json(content)
-                    else:
-                        cues = _parse_caption_xml(content) or _parse_caption_json(content)
-                    if cues:
-                        return cues
+                    stdout = getattr(proc, "stdout", "") or ""
+                    stderr = getattr(proc, "stderr", "") or ""
+                    combined = (stdout + stderr).lower()
 
-                return None  # yt-dlp ran cleanly but found no captions
+                    # Rate-limit → retry outer loop with back-off
+                    if "http error 429" in combined or "too many requests" in combined:
+                        wait = 10 * (2 ** attempt)
+                        time.sleep(wait)
+                        break  # break inner lang loop, retry outer attempt loop
+
+                    # Permanent errors → raise immediately
+                    if "sign in to confirm" in combined or "bot" in combined:
+                        raise YtdlpError("bot-blocked")
+                    if "private video" in combined:
+                        raise YtdlpError("private")
+                    if "video unavailable" in combined or "not available" in combined:
+                        raise YtdlpError("unavailable")
+                    if "has been removed" in combined:
+                        raise YtdlpError("deleted")
+                    if proc.returncode != 0 and combined.strip():
+                        first_err = next(
+                            (ln.strip() for ln in (stdout + stderr).splitlines() if ln.strip()),
+                            "unknown error",
+                        )
+                        raise YtdlpError(first_err[:80])
+
+                    # Parse any subtitle files written to tmpdir
+                    cues = None
+                    for filename in sorted(_os.listdir(tmpdir)):
+                        filepath = _os.path.join(tmpdir, filename)
+                        try:
+                            with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                                content = fh.read()
+                        except Exception:
+                            continue
+                        if not content.strip():
+                            continue
+                        if filename.endswith(".vtt"):
+                            cues = _parse_caption_vtt(content)
+                        elif filename.endswith((".srv3", ".json3")):
+                            cues = _parse_caption_json(content)
+                        else:
+                            cues = _parse_caption_xml(content) or _parse_caption_json(content)
+                        if cues:
+                            return cues
+
+                    if cues is not None:
+                        # Parse succeeded but returned empty — no point trying all-lang
+                        break
+                    # else: no files written for this lang filter → try next pass
+
+                else:
+                    pass  # both passes ran without rate-limit break
+
+                return None  # yt-dlp ran cleanly but found no captions in any language
 
         except YtdlpError:
             raise  # propagate to caller
