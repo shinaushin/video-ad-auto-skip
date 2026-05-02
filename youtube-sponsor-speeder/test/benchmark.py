@@ -646,7 +646,15 @@ def _get_captions_via_ytdlp(
                     )
                     raise YtdlpError(first_err[:80])
 
-                for filename in sorted(_os.listdir(tmpdir)):
+                files = sorted(_os.listdir(tmpdir))
+                if not files:
+                    # Nothing written — log yt-dlp output so we can diagnose
+                    for line in (stdout + stderr).splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("[debug]"):
+                            print(f"    [yt-dlp] {line}", flush=True)
+
+                for filename in files:
                     filepath = _os.path.join(tmpdir, filename)
                     try:
                         with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
