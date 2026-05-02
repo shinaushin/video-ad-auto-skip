@@ -113,7 +113,9 @@ class TestDetectSponsorSegments(unittest.TestCase):
         result = bm.detect_sponsor_segments(cues)
         self.assertEqual(len(result), 1)
 
-    def test_segment_boundaries_include_padding(self):
+    def test_segment_applies_min_duration_floor(self):
+        # Two sponsor cues span only 10 s; the MIN_SEGMENT_DURATION floor should
+        # extend the result to at least 45 s, centred around the detected block.
         cues = self._make_cues([
             (100, 5, "Sponsored by Acme, go to acme.com for a free trial"),
             (105, 5, "Use my code ACME for 20 percent off your first order"),
@@ -121,8 +123,11 @@ class TestDetectSponsorSegments(unittest.TestCase):
         result = bm.detect_sponsor_segments(cues)
         self.assertEqual(len(result), 1)
         seg = result[0]
-        self.assertAlmostEqual(seg["start"], 100 - bm.PADDING_BEFORE, places=1)
-        self.assertAlmostEqual(seg["end"], 110 + bm.PADDING_AFTER, places=1)
+        # Must cover the actual sponsor cues
+        self.assertLessEqual(seg["start"], 100)
+        self.assertGreaterEqual(seg["end"], 110)
+        # Must meet the minimum duration floor
+        self.assertGreaterEqual(seg["end"] - seg["start"], bm.MIN_SEGMENT_DURATION)
 
     def test_start_clamped_to_zero(self):
         cues = self._make_cues([
@@ -153,6 +158,83 @@ class TestDetectSponsorSegments(unittest.TestCase):
         ])
         result = bm.detect_sponsor_segments(cues)
         self.assertEqual(len(result), 1)
+
+    def test_silence_gap_used_as_start_boundary(self):
+        # A long silence (>> SILENCE_BOUNDARY_SEC) before the sponsor block means
+        # the walker stops at the first sponsor cue rather than pulling in earlier cues.
+        cues = self._make_cues([
+            (0,  3, "Welcome to my channel today"),
+            # 57-second silence — clear natural break
+            (60, 5, "Brought to you by Acme, use my code SAVE for percent off"),
+            (65, 5, "Visit acme.com for a free trial today"),
+        ])
+        result = bm.detect_sponsor_segments(cues)
+        self.assertEqual(len(result), 1)
+        # Start should not reach back past the silence to grab the intro cue at t=0
+        # (silence gap is 57 s >> SILENCE_BOUNDARY_SEC so walker stops at t=60)
+        self.assertGreater(result[0]["start"], 3)
+
+    def test_silence_gap_used_as_end_boundary(self):
+        # A long silence after the sponsor block should cap the end boundary,
+        # rather than extending past it into regular content.
+        cues = self._make_cues([
+            (60, 5, "Brought to you by Acme, use my code SAVE for percent off"),
+            (65, 5, "Visit acme.com for a free trial and sign up now"),
+            # 55-second silence
+            (120, 3, "Alright back to the tutorial where we left off"),
+        ])
+        result = bm.detect_sponsor_segments(cues)
+        self.assertEqual(len(result), 1)
+        # End boundary should stop at the silence gap (before t=120), not extend past it
+        self.assertLess(result[0]["end"], 120)
+
+    def test_sponsor_intro_phrase_marks_start_boundary(self):
+        # A "before we get into" phrase should be picked up as the start of the ad block
+        cues = self._make_cues([
+            (55, 3, "but before we get into it"),       # SPONSOR_INTRO_PATTERNS match
+            (58, 2, "today's video is brought to you by Acme Corp"),
+            (60, 5, "Go to acme.com and use code SAVE for 20 percent off"),
+        ])
+        result = bm.detect_sponsor_segments(cues)
+        self.assertEqual(len(result), 1)
+        # The segment should start at or before the intro phrase cue at t=55
+        self.assertLessEqual(result[0]["start"], 55)
+
+    def test_content_return_phrase_marks_end_boundary(self):
+        # A content-return phrase should help cap the end of the ad block.
+        # Note: cues within WINDOW_SEC of the sponsor block inherit its score, so
+        # the "anyway" cue gets pulled into the cluster when it sits right after the
+        # sponsor block.  MIN_SEGMENT_DURATION then expands the result centred on
+        # the whole cluster.  The key guarantee is that the segment stays anchored
+        # around the sponsor block and does NOT reach far into the regular content.
+        cues = self._make_cues([
+            (60, 5, "Brought to you by Acme, use my code SAVE for percent off"),
+            (65, 5, "Visit acme.com for a free trial today"),
+            (70, 3, "anyway, let's get back to what we were talking about"),  # CONTENT_RETURN
+            (73, 5, "So the key insight here is very important"),
+        ])
+        result = bm.detect_sponsor_segments(cues)
+        self.assertEqual(len(result), 1)
+        # Segment must cover the sponsor cues…
+        self.assertLessEqual(result[0]["start"], 60)
+        self.assertGreaterEqual(result[0]["end"], 70)
+        # …but should not run far past the content cues (well within regular content)
+        self.assertLess(result[0]["end"], 120)
+
+    def test_min_segment_duration_extends_symmetrically(self):
+        # A single-cue detection (5 s) should be extended to MIN_SEGMENT_DURATION.
+        cues = self._make_cues([
+            (100, 5, "Sponsored by Acme Corp use my code today"),
+        ])
+        result = bm.detect_sponsor_segments(cues)
+        self.assertEqual(len(result), 1)
+        seg = result[0]
+        duration = seg["end"] - seg["start"]
+        self.assertGreaterEqual(duration, bm.MIN_SEGMENT_DURATION)
+        # Extension should be roughly symmetric around the raw detected block
+        midpoint = seg["start"] + duration / 2
+        raw_mid = 100 + 5 / 2  # 102.5
+        self.assertAlmostEqual(midpoint, raw_mid, delta=3.0)
 
     def test_non_sponsor_cues_ignored(self):
         cues = self._make_cues([

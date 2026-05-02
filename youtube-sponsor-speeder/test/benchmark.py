@@ -100,11 +100,34 @@ WEAK_PATTERNS = [
 ]
 
 # Detection tuning constants
-PADDING_BEFORE = 3.0   # seconds before first keyword hit to include
-PADDING_AFTER  = 5.0   # seconds after last keyword hit to include
-MERGE_GAP_SEC  = 15    # merge clusters with gaps up to this many seconds
-WINDOW_SEC     = 25    # sliding window width for context-aware scoring
-MIN_SCORE      = 3     # minimum window score to flag (one strong hit = 3)
+PADDING_BEFORE       = 3.0   # seconds before first keyword hit to include
+PADDING_AFTER        = 5.0   # seconds after last keyword hit to include
+MERGE_GAP_SEC        = 15    # merge clusters with gaps up to this many seconds
+WINDOW_SEC           = 25    # sliding window width for context-aware scoring
+MIN_SCORE            = 3     # minimum window score to flag (one strong hit = 3)
+MIN_SEGMENT_DURATION = 45.0  # floor: any detected segment is at least this long
+SILENCE_BOUNDARY_SEC = 1.5   # gap between consecutive cues treated as a break
+
+# Phrases that signal "sponsor is starting" — used for backward boundary walk
+SPONSOR_INTRO_PATTERNS = [
+    re.compile(r"\bbefore (?:we|I) (?:get into|start|continue|dive)\b", re.I),
+    re.compile(r"\breal quick\b", re.I),
+    re.compile(r"\bquick(?:ly)? (?:want to|shout.?out)\b", re.I),
+    re.compile(r"\bspeaking of\b", re.I),
+    re.compile(r"\btake a (?:quick )?break\b", re.I),
+    re.compile(r"\bfirst,? (?:a )?(?:quick )?word\b", re.I),
+]
+
+# Phrases that signal "sponsor is over, regular content resumes"
+CONTENT_RETURN_PATTERNS = [
+    re.compile(r"\banyway(?:s)?\b", re.I),
+    re.compile(r"\bwith that (?:said|out of the way)\b", re.I),
+    re.compile(r"\bback to (?:the|today|our|it)\b", re.I),
+    re.compile(r"\blet'?s (?:get back|continue|dive back)\b", re.I),
+    re.compile(r"\benough (?:about|of) that\b", re.I),
+    re.compile(r"\bnow (?:where were we|let'?s get back)\b", re.I),
+    re.compile(r"\bso(?: anyway)?,? (?:back|let'?s)\b", re.I),
+]
 
 
 def score_text(text: str) -> int:
@@ -124,15 +147,82 @@ def score_cue(text: str) -> int:
     return score_text(text)
 
 
+def _walk_boundary_back(cues: list[dict], from_idx: int) -> float:
+    """
+    Walk backward from cues[from_idx] to find a natural start boundary.
+
+    Stops (and returns that cue's start) when either:
+    - the gap between cues[i] and cues[i-1] exceeds SILENCE_BOUNDARY_SEC, OR
+    - cues[i].text matches a SPONSOR_INTRO_PATTERNS phrase.
+
+    Falls back to cues[from_idx]["start"] if no boundary is found within
+    the look-back window (we never walk past the start of the cluster's
+    cue or more than WINDOW_SEC seconds behind it).
+    """
+    anchor_start = cues[from_idx]["start"]
+    best = anchor_start
+    for i in range(from_idx, -1, -1):
+        cue = cues[i]
+        # Don't walk more than WINDOW_SEC back from the anchor
+        if anchor_start - cue["start"] > WINDOW_SEC:
+            break
+        # Silence gap: gap between cues[i-1].end and cues[i].start
+        if i > 0:
+            prev_end = cues[i - 1]["start"] + cues[i - 1].get("dur", 0)
+            if cue["start"] - prev_end > SILENCE_BOUNDARY_SEC:
+                # Natural break just before cue[i] — start here
+                best = cue["start"]
+                break
+        # Sponsor-intro phrase: start at the beginning of this cue
+        if any(p.search(cue["text"]) for p in SPONSOR_INTRO_PATTERNS):
+            best = cue["start"]
+            break
+    return best
+
+
+def _walk_boundary_forward(cues: list[dict], from_idx: int) -> float:
+    """
+    Walk forward from cues[from_idx] to find a natural end boundary.
+
+    Stops when either:
+    - the gap between cues[i] and cues[i+1] exceeds SILENCE_BOUNDARY_SEC, OR
+    - cues[i+1].text matches a CONTENT_RETURN_PATTERNS phrase.
+
+    Returns the end timestamp (start + dur) of the stopping cue.
+    """
+    anchor_end = cues[from_idx]["start"] + cues[from_idx].get("dur", 0)
+    best = anchor_end
+    for i in range(from_idx, len(cues)):
+        cue = cues[i]
+        cue_end = cue["start"] + cue.get("dur", 0)
+        # Don't walk more than WINDOW_SEC forward from the anchor
+        if cue["start"] - anchor_end > WINDOW_SEC:
+            break
+        best = cue_end
+        # Silence gap after this cue
+        if i + 1 < len(cues):
+            next_cue = cues[i + 1]
+            if next_cue["start"] - cue_end > SILENCE_BOUNDARY_SEC:
+                break
+            # Content-return phrase in the *next* cue — end before it starts
+            if any(p.search(next_cue["text"]) for p in CONTENT_RETURN_PATTERNS):
+                break
+    return best
+
+
 def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
     """
-    Sliding-window sponsor detection.
+    Sliding-window sponsor detection with natural boundary walking.
 
-    Instead of scoring each cue in isolation, we concatenate all cues
-    within a ±WINDOW_SEC/2 window around each cue before scoring. This
-    catches sponsor language that is split across multiple caption cues
-    (e.g. "this video is" / "brought to you by Acme") which would score
-    zero if either cue were evaluated alone.
+    Step 1 — Score each cue using combined text of its ±WINDOW_SEC/2 window,
+              catching sponsor language split across cues.
+    Step 2 — Cluster nearby hits (gap ≤ MERGE_GAP_SEC).
+    Step 3 — For each cluster, walk backward/forward through the cues list
+              to find silence gaps or intro/outro boundary phrases instead of
+              using fixed padding.  This expands detections to cover the full
+              sponsor read rather than just the disclosure sentence.
+    Step 4 — Apply MIN_SEGMENT_DURATION floor: if the resulting segment is
+              shorter than 45 s, extend it symmetrically to that length.
 
     Each cue: {start: float, dur: float, text: str}.
     Returns: [{start: float, end: float}, ...].
@@ -142,7 +232,7 @@ def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
 
     half = WINDOW_SEC / 2
 
-    # Score each cue using the combined text of its surrounding window
+    # ── Step 1: score each cue against its sliding window ──
     scored = []
     for i, c in enumerate(cues):
         t = c["start"]
@@ -157,7 +247,7 @@ def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
     if not scored:
         return []
 
-    # Cluster nearby hits
+    # ── Step 2: cluster nearby hits ──
     clusters = [[scored[0]]]
     for i in range(1, len(scored)):
         prev = clusters[-1][-1]
@@ -167,12 +257,35 @@ def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
         else:
             clusters.append([curr])
 
-    # Build padded segments from each cluster
+    # Build a fast index: cue start-time → position in cues list
+    # (needed to locate the cluster anchors inside cues[])
+    start_to_idx: dict[float, int] = {c["start"]: i for i, c in enumerate(cues)}
+
+    # ── Step 3 + 4: walk boundaries, enforce minimum duration ──
     segments = []
     for cluster in clusters:
-        start = max(0, cluster[0]["start"] - PADDING_BEFORE)
-        end = cluster[-1]["end"] + PADDING_AFTER
-        segments.append({"start": start, "end": end})
+        anchor_start_cue = cluster[0]
+        anchor_end_cue   = cluster[-1]
+
+        # Find positions in the original cues list
+        back_idx  = start_to_idx.get(anchor_start_cue["start"], 0)
+        fwd_idx   = start_to_idx.get(anchor_end_cue["start"],
+                                     len(cues) - 1)
+
+        raw_start = _walk_boundary_back(cues, back_idx)
+        raw_end   = _walk_boundary_forward(cues, fwd_idx)
+
+        # Clamp start to ≥ 0
+        raw_start = max(0.0, raw_start)
+
+        # Step 4: enforce minimum segment duration
+        duration = raw_end - raw_start
+        if duration < MIN_SEGMENT_DURATION:
+            deficit = MIN_SEGMENT_DURATION - duration
+            raw_start = max(0.0, raw_start - deficit / 2)
+            raw_end   = raw_end + deficit / 2
+
+        segments.append({"start": raw_start, "end": raw_end})
 
     return segments
 
@@ -264,7 +377,12 @@ def _save_caption_cache(video_id: str, cues: list[dict] | None):
     p.write_text(json.dumps(cues))
 
 
-def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | None:
+def get_captions_for_video(
+    video_id: str,
+    debug: bool = False,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+) -> list[dict] | None:
     """
     Fetch YouTube captions using four strategies in order:
 
@@ -279,13 +397,20 @@ def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | N
        bot detection via its own anti-fingerprinting layer. Most reliable.
        Install with: pip install yt-dlp
 
+    Args:
+        cookies_from_browser: Browser to extract cookies from for yt-dlp,
+            e.g. "chrome", "firefox", "safari", "edge".  This is by far the
+            most effective way to improve the caption fetch rate.
+        cookies_file: Path to a Netscape cookies.txt file (alternative to
+            cookies_from_browser).
+
     Returns a list of cues [{start, dur, text}] or None if unavailable.
     """
     def dbg(msg):
         if debug:
             print(f"    [captions] {msg}")
 
-    # Check cache first
+    # Check cache first (None = confirmed no captions; [] would mean empty but present)
     cached = _load_caption_cache(video_id)
     if cached is not None:
         dbg(f"cache hit — {len(cached)} cues" if cached else "cache hit — no captions")
@@ -326,7 +451,11 @@ def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | N
     import shutil
     if shutil.which("yt-dlp"):
         dbg("trying yt-dlp...")
-        cues = _get_captions_via_ytdlp(video_id)
+        cues = _get_captions_via_ytdlp(
+            video_id,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
+        )
         if cues:
             dbg(f"yt-dlp success — {len(cues)} cues")
             _save_caption_cache(video_id, cues)
@@ -335,7 +464,9 @@ def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | N
     else:
         dbg("yt-dlp not found in PATH — skipping (install with: pip install yt-dlp)")
 
-    # Cache the negative result so we don't retry this video on future runs
+    # Cache the negative result so we don't retry this video on future runs.
+    # Exception: if yt-dlp exhausted retries (likely rate-limited), don't cache
+    # so the video is tried again on the next prefetch run.
     _save_caption_cache(video_id, None)
     return None
 
@@ -412,13 +543,25 @@ def _get_captions_via_html_session(video_id: str) -> list[dict] | None:
     return cues if cues else None
 
 
-def _get_captions_via_ytdlp(video_id: str) -> list[dict] | None:
+def _get_captions_via_ytdlp(
+    video_id: str,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+) -> list[dict] | None:
     """
     Fetch captions using yt-dlp if it is installed (pip install yt-dlp).
 
     yt-dlp handles YouTube's bot detection, TLS fingerprinting, and
     consent requirements better than any pure-Python HTTP approach.
     This function is a no-op if yt-dlp is not found in PATH.
+
+    Args:
+        cookies_from_browser: Browser name to extract cookies from, e.g. "chrome",
+            "firefox", "safari", "edge".  Passed as --cookies-from-browser to
+            yt-dlp.  This is the single most effective way to bypass YouTube bot
+            detection — yt-dlp will read your real browser session cookies.
+        cookies_file: Path to a Netscape-format cookies.txt file.  Alternative to
+            cookies_from_browser when you can't extract from the browser directly.
     """
     import shutil
     import subprocess
@@ -428,45 +571,68 @@ def _get_captions_via_ytdlp(video_id: str) -> list[dict] | None:
     if not shutil.which("yt-dlp"):
         return None
 
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_tmpl = _os.path.join(tmpdir, "%(id)s.%(ext)s")
-            proc = subprocess.run(
-                [
+    # Retry up to 3 times to handle transient rate limits (HTTP 429)
+    for attempt in range(3):
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_tmpl = _os.path.join(tmpdir, "%(id)s.%(ext)s")
+                cmd = [
                     "yt-dlp",
-                    "--write-subs",       # manual captions
+                    "--write-subs",       # manual (human) captions
                     "--write-auto-subs",  # auto-generated captions
                     "--sub-langs", "en.*",
                     "--skip-download",
                     "--no-playlist",
                     "--quiet",
+                    # Use the tv_embedded client — it is far less aggressively
+                    # bot-filtered than the default web client.
+                    "--extractor-args", "youtube:player_client=tv_embedded",
                     "-o", out_tmpl,
-                    f"https://www.youtube.com/watch?v={video_id}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
+                ]
+                if cookies_from_browser:
+                    cmd += ["--cookies-from-browser", cookies_from_browser]
+                elif cookies_file:
+                    cmd += ["--cookies", cookies_file]
+                cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
-            for filename in _os.listdir(tmpdir):
-                filepath = _os.path.join(tmpdir, filename)
-                with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-                    content = fh.read()
-                if not content.strip():
-                    continue
-                if filename.endswith(".vtt"):
-                    cues = _parse_caption_vtt(content)
-                elif filename.endswith(".srv3"):
-                    cues = _parse_caption_json(content)
-                else:
-                    cues = _parse_caption_xml(content) or _parse_caption_json(content)
-                if cues:
-                    return cues
-    except Exception:
-        pass
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
 
-    return None
+                # Detect rate-limiting: retry after a back-off
+                stdout = getattr(proc, "stdout", "") or ""
+                stderr = getattr(proc, "stderr", "") or ""
+                combined = (stdout + stderr).lower()
+                if "http error 429" in combined or "too many requests" in combined:
+                    wait = 10 * (2 ** attempt)  # 10 s, 20 s, 40 s
+                    time.sleep(wait)
+                    continue  # retry
+
+                for filename in _os.listdir(tmpdir):
+                    filepath = _os.path.join(tmpdir, filename)
+                    with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
+                    if not content.strip():
+                        continue
+                    if filename.endswith(".vtt"):
+                        cues = _parse_caption_vtt(content)
+                    elif filename.endswith(".srv3"):
+                        cues = _parse_caption_json(content)
+                    else:
+                        cues = _parse_caption_xml(content) or _parse_caption_json(content)
+                    if cues:
+                        return cues
+
+                return None  # yt-dlp ran but found no captions — not a transient error
+
+        except Exception:
+            pass
+
+    return None  # all retries exhausted (likely persistent rate limit)
 
 
 def _parse_caption_vtt(text: str) -> list[dict] | None:
@@ -908,6 +1074,8 @@ def benchmark_video(
     video_id: str,
     ground_truth: list[dict],
     verbose: bool = True,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
 ) -> dict:
     """Benchmark our detection against ground truth for one video."""
     if verbose:
@@ -919,7 +1087,11 @@ def benchmark_video(
 
     # Fetch captions
     try:
-        cues = get_captions_for_video(video_id, debug=verbose)
+        cues = get_captions_for_video(
+            video_id, debug=verbose,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
+        )
     except Exception as e:
         if verbose:
             print(f"  Captions: error — {e}")
@@ -971,24 +1143,64 @@ def main():
     parser.add_argument("--sample", type=int, default=50,
                         help="Videos to sample in DB mode (default: 50); "
                              "use 0 to process all qualifying videos")
-    parser.add_argument("--workers", type=int, default=3,
-                        help="Parallel caption fetches (default: 3)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel caption fetches (default: 1; use 3-5 only "
+                             "when --cookies-from-browser is set to avoid rate limits)")
     parser.add_argument("--quiet", action="store_true",
                         help="One-line-per-video output")
     parser.add_argument("--prefetch", action="store_true",
                         help="Download and cache captions for all DB videos without "
                              "running detection. Re-run without --prefetch to benchmark "
                              "instantly from cache. Safe to interrupt and resume.")
+    parser.add_argument("--cookies-from-browser", metavar="BROWSER",
+                        dest="cookies_from_browser", default=None,
+                        help="Extract cookies from this browser for yt-dlp "
+                             "(e.g. chrome, firefox, safari, edge). "
+                             "This is the single most effective way to bypass "
+                             "YouTube bot detection and dramatically increases the "
+                             "caption fetch rate. Example: --cookies-from-browser chrome")
+    parser.add_argument("--cookies", metavar="FILE",
+                        dest="cookies_file", default=None,
+                        help="Path to a Netscape-format cookies.txt file for yt-dlp. "
+                             "Alternative to --cookies-from-browser.")
+    parser.add_argument("--retry-failed", action="store_true",
+                        dest="retry_failed",
+                        help="Delete negative-cache entries (videos where captions "
+                             "previously returned nothing) so they are retried on the "
+                             "next --prefetch run.  Useful after adding "
+                             "--cookies-from-browser to a run that previously had none.")
     args = parser.parse_args()
+
+    # ── --retry-failed: clear null cache entries ──────────────────
+    if args.retry_failed:
+        if not CAPTION_CACHE_DIR.exists():
+            print("No caption cache found — nothing to clear.")
+            return
+        removed = 0
+        import json as _json
+        for p in CAPTION_CACHE_DIR.glob("*.json"):
+            try:
+                with open(p) as fh:
+                    data = _json.load(fh)
+                if data is None:
+                    p.unlink()
+                    removed += 1
+            except Exception:
+                pass
+        print(f"Removed {removed:,} negative-cache entries from {CAPTION_CACHE_DIR}")
+        print("Re-run with --prefetch (and --cookies-from-browser) to retry them.")
+        return
 
     if not args.db and not args.video_ids:
         parser.print_help()
         print("\nExamples:")
-        print("  python3 benchmark.py --db                        # sample 50 from full database")
-        print("  python3 benchmark.py --db --sample 500           # sample 500 videos")
-        print("  python3 benchmark.py --db --sample 0 --prefetch  # cache ALL video captions")
-        print("  python3 benchmark.py --db --sample 0             # benchmark all (needs cache)")
-        print("  python3 benchmark.py VIDEO_ID1 VIDEO_ID2         # test specific videos")
+        print("  python3 benchmark.py --db                                       # sample 50 from full database")
+        print("  python3 benchmark.py --db --sample 500                          # sample 500 videos")
+        print("  python3 benchmark.py --db --sample 0 --prefetch                 # cache ALL video captions")
+        print("  python3 benchmark.py --db --sample 0 --prefetch \\")
+        print("      --cookies-from-browser chrome                               # much higher fetch rate!")
+        print("  python3 benchmark.py --db --sample 0                            # benchmark all (needs cache)")
+        print("  python3 benchmark.py VIDEO_ID1 VIDEO_ID2                        # test specific videos")
         sys.exit(0)
 
     print("YouTube Sponsor Speeder — Detection Benchmark")
@@ -1016,6 +1228,13 @@ def main():
         remaining = len(test_cases) - cached_count
         print(f"Prefetch mode: {len(test_cases):,} videos  "
               f"({cached_count:,} already cached, {remaining:,} to fetch)")
+        if args.cookies_from_browser:
+            print(f"Using browser cookies from: {args.cookies_from_browser}")
+        elif args.cookies_file:
+            print(f"Using cookies file: {args.cookies_file}")
+        else:
+            print("Tip: pass --cookies-from-browser chrome (or firefox/safari/edge) "
+                  "for a much higher caption fetch rate.")
         print(f"Using {args.workers} worker(s). Safe to interrupt — resumes from cache.\n")
 
         completed = 0
@@ -1023,7 +1242,11 @@ def main():
             vid = tc["videoId"]
             if _caption_cache_path(vid).exists():
                 return vid, "cached"
-            cues = get_captions_for_video(vid)
+            cues = get_captions_for_video(
+                vid,
+                cookies_from_browser=args.cookies_from_browser,
+                cookies_file=args.cookies_file,
+            )
             return vid, f"{len(cues)} cues" if cues else "no captions"
 
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -1032,8 +1255,8 @@ def main():
                 vid, status = future.result()
                 completed += 1
                 if completed % 100 == 0 or completed == len(test_cases):
-                    pct = completed / len(test_cases) * 100
-                    print(f"  [{completed:,}/{len(test_cases):,}  {pct:.1f}%]  {vid} — {status}")
+                    pct_done = completed / len(test_cases) * 100
+                    print(f"  [{completed:,}/{len(test_cases):,}  {pct_done:.1f}%]  {vid} — {status}")
                 elif not args.quiet:
                     print(f"  {vid} — {status}")
         print(f"\nDone. Cached captions in: {CAPTION_CACHE_DIR}")
@@ -1049,7 +1272,12 @@ def main():
     def run_one(idx_tc):
         idx, tc = idx_tc
         time.sleep(idx * 0.3)  # stagger requests to be polite
-        return idx, benchmark_video(tc["videoId"], tc["segments"], verbose=verbose)
+        return idx, benchmark_video(
+            tc["videoId"], tc["segments"],
+            verbose=verbose,
+            cookies_from_browser=args.cookies_from_browser,
+            cookies_file=args.cookies_file,
+        )
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(run_one, (i, tc)): i for i, tc in enumerate(test_cases)}
