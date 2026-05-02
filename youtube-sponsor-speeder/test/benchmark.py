@@ -584,9 +584,6 @@ def _get_captions_via_ytdlp(
                     "--skip-download",
                     "--no-playlist",
                     "--quiet",
-                    # Use the tv_embedded client — it is far less aggressively
-                    # bot-filtered than the default web client.
-                    "--extractor-args", "youtube:player_client=tv_embedded",
                     "-o", out_tmpl,
                 ]
                 if cookies_from_browser:
