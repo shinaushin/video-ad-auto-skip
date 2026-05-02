@@ -32,6 +32,7 @@ import random
 import re
 import sys
 import time
+import http.cookiejar
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,48 +42,73 @@ from xml.etree import ElementTree
 # ─── Detection logic (mirrored from content.js) ────────────────
 
 STRONG_PATTERNS = [
-    re.compile(r"this (?:video|segment|portion) is (?:brought to you|sponsored|made possible) by", re.I),
+    # Explicit sponsorship disclosure
+    re.compile(r"this (?:video|segment|portion|episode) is (?:brought to you|sponsored|made possible) by", re.I),
     re.compile(r"(?:sponsored|presented) by", re.I),
-    re.compile(r"today'?s sponsor", re.I),
-    re.compile(r"thanks to .{1,40} for sponsoring", re.I),
+    re.compile(r"today'?s (?:video is )?sponsor", re.I),
+    re.compile(r"this (?:week|episode)'?s sponsor", re.I),
+    re.compile(r"our (?:sponsor|partner)", re.I),
+    re.compile(r"(?:a )?(?:quick |brief )?(?:word|message) from (?:our |today'?s )?sponsor", re.I),
+    re.compile(r"(?:video|episode) (?:is )?(?:sponsored|supported) by", re.I),
+    re.compile(r"made (?:this video )?possible by", re.I),
+    re.compile(r"thanks? to .{1,40} for (?:sponsoring|supporting|making this)", re.I),
     re.compile(r"a (?:huge|big|special) thanks? to", re.I),
     re.compile(r"brought to you by", re.I),
-    re.compile(r"use (?:my |our )?(?:code|link)", re.I),
+    re.compile(r"partnered with", re.I),
+    re.compile(r"in partnership with", re.I),
+    # Calls to action with codes / links
+    re.compile(r"use (?:my |our )?(?:code|link|referral)", re.I),
     re.compile(r"use code .{1,20} (?:at|for) checkout", re.I),
+    re.compile(r"(?:my|our|the) (?:affiliate |referral )?(?:code|link) (?:is |in )", re.I),
+    re.compile(r"if you (?:use|click) (?:my|the) link", re.I),
+    re.compile(r"link (?:is )?in (?:the )?description", re.I),
+    re.compile(r"click (?:the|my) link", re.I),
+    re.compile(r"check (?:them )?out at", re.I),
     re.compile(r"go to .{1,40}\.com", re.I),
     re.compile(r"head (?:on )?over to .{1,40}\.com", re.I),
     re.compile(r"visit .{1,40}\.com", re.I),
-    re.compile(r"check (?:them )?out at", re.I),
-    re.compile(r"click (?:the|my) link", re.I),
-    re.compile(r"link (?:is )?in (?:the )?description", re.I),
+    re.compile(r"download .{1,30} (?:app|today|now|for free)", re.I),
+    # Offers and discounts
     re.compile(r"first \d+ (?:people|users|customers|subscribers)", re.I),
+    re.compile(r"(?:get |try ).{1,30} for free", re.I),
     re.compile(r"free trial", re.I),
+    re.compile(r"\d+ (?:days?|months?) (?:free|trial)", re.I),
+    re.compile(r"free (?:\d+-)?(?:day|month|week) trial", re.I),
     re.compile(r"percent off", re.I),
-    re.compile(r"% off", re.I),
+    re.compile(r"\d+% off", re.I),
+    re.compile(r"(?:save|get) \d+%", re.I),
     re.compile(r"discount code", re.I),
     re.compile(r"promo code", re.I),
     re.compile(r"coupon code", re.I),
+    re.compile(r"exclusive (?:discount|deal|offer|code) (?:for )?(?:my )?(?:viewers?|subscribers?|listeners?|audience)", re.I),
+    re.compile(r"(?:my |our )?viewers? (?:get|receive|save|can get)", re.I),
 ]
 
 WEAK_PATTERNS = [
     re.compile(r"sign up", re.I),
     re.compile(r"download the app", re.I),
     re.compile(r"available (?:now )?at", re.I),
-    re.compile(r"money back guarantee", re.I),
+    re.compile(r"money.?back guarantee", re.I),
     re.compile(r"limited time", re.I),
     re.compile(r"exclusive (?:deal|offer)", re.I),
-    re.compile(r"subscribe", re.I),
-    re.compile(r"premium", re.I),
+    re.compile(r"start (?:your )?(?:free )?(?:trial|subscription)", re.I),
+    re.compile(r"check (?:it|them) out", re.I),
+    re.compile(r"learn more", re.I),
+    re.compile(r"(?:scan|use) (?:the )?QR code", re.I),
+    re.compile(r"premium (?:plan|subscription|membership|account)", re.I),
+    re.compile(r"no ?(?:cost|charge|credit card)(?: required)?", re.I),
 ]
 
-PADDING_BEFORE = 1.5
-PADDING_AFTER = 2.0
-MERGE_GAP_SEC = 8
-MIN_KEYWORD_HITS = 2
+# Detection tuning constants
+PADDING_BEFORE = 3.0   # seconds before first keyword hit to include
+PADDING_AFTER  = 5.0   # seconds after last keyword hit to include
+MERGE_GAP_SEC  = 15    # merge clusters with gaps up to this many seconds
+WINDOW_SEC     = 25    # sliding window width for context-aware scoring
+MIN_SCORE      = 3     # minimum window score to flag (one strong hit = 3)
 
 
-def score_cue(text: str) -> int:
-    """Score a caption cue for sponsor likelihood."""
+def score_text(text: str) -> int:
+    """Score a block of text for sponsor likelihood."""
     score = 0
     for pat in STRONG_PATTERNS:
         if pat.search(text):
@@ -93,19 +119,39 @@ def score_cue(text: str) -> int:
     return score
 
 
+# Keep the old name as an alias so tests and callers don't break
+def score_cue(text: str) -> int:
+    return score_text(text)
+
+
 def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
     """
-    Run sponsor detection on a list of caption cues.
+    Sliding-window sponsor detection.
+
+    Instead of scoring each cue in isolation, we concatenate all cues
+    within a ±WINDOW_SEC/2 window around each cue before scoring. This
+    catches sponsor language that is split across multiple caption cues
+    (e.g. "this video is" / "brought to you by Acme") which would score
+    zero if either cue were evaluated alone.
+
     Each cue: {start: float, dur: float, text: str}.
     Returns: [{start: float, end: float}, ...].
     """
     if not cues:
         return []
 
+    half = WINDOW_SEC / 2
+
+    # Score each cue using the combined text of its surrounding window
     scored = []
-    for c in cues:
-        s = score_cue(c["text"])
-        if s > 0:
+    for i, c in enumerate(cues):
+        t = c["start"]
+        window_text = " ".join(
+            x["text"] for x in cues
+            if t - half <= x["start"] <= t + half
+        )
+        s = score_text(window_text)
+        if s >= MIN_SCORE:
             scored.append({**c, "end": c["start"] + c["dur"], "score": s})
 
     if not scored:
@@ -121,12 +167,9 @@ def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
         else:
             clusters.append([curr])
 
-    # Filter by minimum keyword density and build segments
+    # Build padded segments from each cluster
     segments = []
     for cluster in clusters:
-        total_score = sum(c["score"] for c in cluster)
-        if total_score < MIN_KEYWORD_HITS * 3:
-            continue
         start = max(0, cluster[0]["start"] - PADDING_BEFORE)
         end = cluster[-1]["end"] + PADDING_AFTER
         segments.append({"start": start, "end": end})
@@ -136,7 +179,12 @@ def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
 
 # ─── HTTP helpers ───────────────────────────────────────────────
 
-HEADERS = {"User-Agent": "SponsorSpeedBenchmark/1.0 (Python)"}
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+HEADERS = {"User-Agent": BROWSER_UA}
 
 
 def http_get(url: str, timeout: int = 30) -> str:
@@ -144,6 +192,17 @@ def http_get(url: str, timeout: int = 30) -> str:
     req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def http_post_json(url: str, body: dict, timeout: int = 30):
+    """POST JSON to a URL and return the parsed JSON response."""
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={**HEADERS, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
 def http_get_json(url: str, timeout: int = 30):
@@ -159,49 +218,370 @@ def http_get_json(url: str, timeout: int = 30):
 
 # ─── YouTube caption fetching ──────────────────────────────────
 
-def get_captions_for_video(video_id: str) -> list[dict] | None:
+# YouTube InnerTube API client configs, tried in order.
+# TVHTML5 bypasses consent walls and age-gates most reliably.
+# ANDROID is a robust fallback. WEB is last as it's most bot-detected.
+INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+INNERTUBE_CLIENTS = [
+    {
+        "clientName": "TVHTML5",
+        "clientVersion": "7.20240201.16.00",
+    },
+    {
+        "clientName": "ANDROID",
+        "clientVersion": "19.09.37",
+        "androidSdkVersion": 30,
+    },
+    {
+        "clientName": "WEB",
+        "clientVersion": "2.20250401.00.00",
+    },
+]
+
+
+def get_captions_for_video(video_id: str, debug: bool = False) -> list[dict] | None:
     """
-    Fetch YouTube captions for a video.
+    Fetch YouTube captions using four strategies in order:
+
+    1. InnerTube /player API — YouTube's internal JSON API, tries multiple
+       client configs (TVHTML5 → ANDROID → WEB).
+    2. HTML scrape (URL-only) — extracts a signed timedtext URL from the
+       watch page, then fetches it in a separate request.
+    3. HTML scrape with cookie session — like strategy 2 but shares
+       a CookieJar (including SOCS consent) between the page fetch and
+       the timedtext fetch.
+    4. yt-dlp — used if the `yt-dlp` CLI is installed. Bypasses all
+       bot detection via its own anti-fingerprinting layer. Most reliable.
+       Install with: pip install yt-dlp
+
     Returns a list of cues [{start, dur, text}] or None if unavailable.
     """
-    html = http_get(f"https://www.youtube.com/watch?v={video_id}", timeout=15)
+    def dbg(msg):
+        if debug:
+            print(f"    [captions] {msg}")
 
-    # Extract captionTracks JSON from the player response
+    # Strategy 1: InnerTube API
+    dbg("trying InnerTube API...")
+    base_url = _get_caption_url_innertube(video_id)
+
+    # Strategy 2: HTML scrape — URL extracted, fetched separately
+    if not base_url:
+        dbg("InnerTube failed, trying HTML scrape (no cookies)...")
+        base_url = _get_caption_url_html(video_id)
+
+    if base_url:
+        dbg(f"got URL, fetching content...")
+        raw = http_get(base_url, timeout=15)
+        if raw:
+            cues = _parse_caption_xml(raw) or _parse_caption_json(raw)
+            if cues:
+                dbg(f"success — {len(cues)} cues")
+                return cues
+            dbg(f"URL fetched {len(raw)} bytes but parsed 0 cues")
+        else:
+            dbg("URL fetch returned empty body")
+
+    # Strategy 3: HTML scrape with shared cookie session
+    dbg("trying HTML scrape with cookie session (SOCS)...")
+    cues = _get_captions_via_html_session(video_id)
+    if cues:
+        dbg(f"cookie session success — {len(cues)} cues")
+        return cues
+    dbg("cookie session returned no cues")
+
+    # Strategy 4: yt-dlp (optional, most reliable)
+    import shutil
+    if shutil.which("yt-dlp"):
+        dbg("trying yt-dlp...")
+        cues = _get_captions_via_ytdlp(video_id)
+        if cues:
+            dbg(f"yt-dlp success — {len(cues)} cues")
+            return cues
+        dbg("yt-dlp returned no cues (check: does the video have captions on YouTube?)")
+    else:
+        dbg("yt-dlp not found in PATH — skipping (install with: pip install yt-dlp)")
+
+    return None
+
+
+def _make_cookie(name: str, value: str, domain: str = ".youtube.com") -> http.cookiejar.Cookie:
+    """Create a Cookie object suitable for insertion into a CookieJar."""
+    return http.cookiejar.Cookie(
+        version=0, name=name, value=value,
+        port=None, port_specified=False,
+        domain=domain, domain_specified=True, domain_initial_dot=True,
+        path="/", path_specified=True,
+        secure=False, expires=None, discard=True,
+        comment=None, comment_url=None, rest={"HttpOnly": None},
+    )
+
+
+def _get_captions_via_html_session(video_id: str) -> list[dict] | None:
+    """
+    Fetch captions by replaying the watch page session with a CookieJar.
+
+    YouTube's timedtext server returns 0 bytes (HTTP 200, text/html) for
+    sessions that have not accepted cookie consent. The SOCS cookie
+    ("CAI" = accept all) must be pre-seeded before the watch page is
+    fetched, or the session is treated as unconsented and all timedtext
+    requests are silently rejected.
+    """
+    jar = http.cookiejar.CookieJar()
+    # Pre-accept cookie consent so YouTube serves full content.
+    # SOCS=CAI is the minimal consent-accepted token recognised by YouTube.
+    jar.set_cookie(_make_cookie("SOCS", "CAI"))
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+    # Step 1: fetch the watch page (with consent cookie already set)
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        page_req = urllib.request.Request(watch_url, headers=HEADERS)
+        with opener.open(page_req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    # Step 2: extract a captionTracks URL from the page HTML
     match = re.search(r'"captionTracks":\s*(\[.*?\])', html)
     if not match:
         return None
-
     try:
         tracks = json.loads(match.group(1))
     except json.JSONDecodeError:
         return None
-
     if not tracks:
         return None
 
-    # Prefer English
     english = next((t for t in tracks if t.get("languageCode", "").startswith("en")), None)
-    track = english or tracks[0]
-    base_url = track.get("baseUrl")
+    base_url = (english or tracks[0]).get("baseUrl")
     if not base_url:
         return None
 
-    # Fetch and parse timed-text XML
-    xml_text = http_get(base_url, timeout=15)
+    # Step 3: fetch the caption content with the same opener (sends cookies)
+    # Include Referer so the timedtext server treats this as a page-originated request.
     try:
-        root = ElementTree.fromstring(xml_text)
-    except ElementTree.ParseError:
+        cap_req = urllib.request.Request(
+            base_url,
+            headers={**HEADERS, "Referer": watch_url},
+        )
+        with opener.open(cap_req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except Exception:
         return None
 
+    if not raw:
+        return None
+
+    cues = _parse_caption_xml(raw) or _parse_caption_json(raw)
+    return cues if cues else None
+
+
+def _get_captions_via_ytdlp(video_id: str) -> list[dict] | None:
+    """
+    Fetch captions using yt-dlp if it is installed (pip install yt-dlp).
+
+    yt-dlp handles YouTube's bot detection, TLS fingerprinting, and
+    consent requirements better than any pure-Python HTTP approach.
+    This function is a no-op if yt-dlp is not found in PATH.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    import os as _os
+
+    if not shutil.which("yt-dlp"):
+        return None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_tmpl = _os.path.join(tmpdir, "%(id)s.%(ext)s")
+            proc = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--write-subs",       # manual captions
+                    "--write-auto-subs",  # auto-generated captions
+                    "--sub-langs", "en.*",
+                    "--skip-download",
+                    "--no-playlist",
+                    "--quiet",
+                    "-o", out_tmpl,
+                    f"https://www.youtube.com/watch?v={video_id}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+            for filename in _os.listdir(tmpdir):
+                filepath = _os.path.join(tmpdir, filename)
+                with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+                if not content.strip():
+                    continue
+                if filename.endswith(".vtt"):
+                    cues = _parse_caption_vtt(content)
+                elif filename.endswith(".srv3"):
+                    cues = _parse_caption_json(content)
+                else:
+                    cues = _parse_caption_xml(content) or _parse_caption_json(content)
+                if cues:
+                    return cues
+    except Exception:
+        pass
+
+    return None
+
+
+def _parse_caption_vtt(text: str) -> list[dict] | None:
+    """Parse WebVTT caption format into cues."""
+    cues = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "-->" in line:
+            parts = line.split("-->")
+            if len(parts) == 2:
+                try:
+                    start = _vtt_time_to_sec(parts[0].strip().split()[0])
+                    end = _vtt_time_to_sec(parts[1].strip().split()[0])
+                    dur = max(end - start, 0.001)
+                except (ValueError, IndexError):
+                    i += 1
+                    continue
+                i += 1
+                text_parts = []
+                while i < len(lines) and lines[i].strip():
+                    # Strip VTT inline tags (<c>, <00:00:01.234>, etc.)
+                    clean = re.sub(r"<[^>]+>", "", lines[i]).strip()
+                    if clean:
+                        text_parts.append(clean)
+                    i += 1
+                joined = " ".join(text_parts).strip()
+                if joined:
+                    cues.append({"start": start, "dur": dur, "text": joined})
+                continue
+        i += 1
+    return cues or None
+
+
+def _vtt_time_to_sec(t: str) -> float:
+    """Convert a VTT timestamp (HH:MM:SS.mmm or MM:SS.mmm) to seconds."""
+    parts = t.split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(parts[0])
+
+
+def _parse_caption_xml(text: str) -> list[dict] | None:
+    """Parse YouTube's timed-text XML format into cues."""
+    try:
+        root = ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        return None
     cues = []
     for elem in root.iter("text"):
         start = float(elem.get("start", "0"))
         dur = float(elem.get("dur", "2"))
-        text = (elem.text or "").replace("\n", " ").strip()
-        if text:
-            cues.append({"start": start, "dur": dur, "text": text})
+        raw_text = (elem.text or "").replace("\n", " ").strip()
+        if raw_text:
+            cues.append({"start": start, "dur": dur, "text": raw_text})
+    return cues or None
 
-    return cues if cues else None
+
+def _parse_caption_json(text: str) -> list[dict] | None:
+    """Parse YouTube's srv3/json3 caption format into cues."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    cues = []
+    # srv3 / json3 format: {"events": [{"tStartMs": ..., "dDurationMs": ..., "segs": [...]}]}
+    for event in data.get("events", []):
+        start = event.get("tStartMs", 0) / 1000
+        dur = event.get("dDurationMs", 2000) / 1000
+        segs = event.get("segs", [])
+        raw_text = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
+        if raw_text and raw_text != "\n":
+            cues.append({"start": start, "dur": dur, "text": raw_text})
+    return cues or None
+
+
+def _get_caption_url_innertube(video_id: str) -> str | None:
+    """
+    Fetch caption track URL via YouTube's InnerTube /player API.
+    Tries multiple client configs in order — TVHTML5 is most reliable
+    for bypassing consent walls and bot detection.
+    """
+    api_url = f"https://www.youtube.com/youtubei/v1/player?key={INNERTUBE_API_KEY}"
+    for client in INNERTUBE_CLIENTS:
+        try:
+            payload = {
+                "context": {"client": client},
+                "videoId": video_id,
+            }
+            data = http_post_json(api_url, payload, timeout=15)
+
+            tracks = (
+                data.get("captions", {})
+                .get("playerCaptionsTracklistRenderer", {})
+                .get("captionTracks", [])
+            )
+            if not tracks:
+                continue  # try next client
+
+            # Prefer English, fall back to first available
+            english = next(
+                (t for t in tracks if t.get("languageCode", "").startswith("en")),
+                None,
+            )
+            track = english or tracks[0]
+            base_url = track.get("baseUrl")
+            if base_url:
+                return base_url
+        except Exception:
+            continue  # try next client
+
+    # Last-resort: direct timedtext API (no auth required, often still works)
+    return _get_caption_url_timedtext(video_id)
+
+
+def _get_caption_url_timedtext(video_id: str) -> str | None:
+    """Fallback: YouTube's legacy timedtext API endpoint."""
+    try:
+        url = f"https://www.youtube.com/api/timedtext?v={video_id}&lang=en&fmt=srv3"
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read()
+        # If we got a non-empty response, return the URL directly
+        if body and len(body) > 50:
+            return url
+        return None
+    except Exception:
+        return None
+
+
+def _get_caption_url_html(video_id: str) -> str | None:
+    """Fallback: scrape caption track URL from the YouTube watch page HTML."""
+    try:
+        html = http_get(f"https://www.youtube.com/watch?v={video_id}", timeout=15)
+        match = re.search(r'"captionTracks":\s*(\[.*?\])', html)
+        if not match:
+            return None
+        tracks = json.loads(match.group(1))
+        if not tracks:
+            return None
+        english = next(
+            (t for t in tracks if t.get("languageCode", "").startswith("en")),
+            None,
+        )
+        track = english or tracks[0]
+        return track.get("baseUrl")
+    except Exception:
+        return None
 
 
 # ─── SponsorBlock API (single-video mode) ──────────────────────
@@ -501,7 +881,7 @@ def benchmark_video(
 
     # Fetch captions
     try:
-        cues = get_captions_for_video(video_id)
+        cues = get_captions_for_video(video_id, debug=verbose)
     except Exception as e:
         if verbose:
             print(f"  Captions: error — {e}")
