@@ -451,22 +451,28 @@ def get_captions_for_video(
     import shutil
     if shutil.which("yt-dlp"):
         dbg("trying yt-dlp...")
-        cues = _get_captions_via_ytdlp(
-            video_id,
-            cookies_from_browser=cookies_from_browser,
-            cookies_file=cookies_file,
-        )
+        try:
+            cues = _get_captions_via_ytdlp(
+                video_id,
+                cookies_from_browser=cookies_from_browser,
+                cookies_file=cookies_file,
+            )
+        except YtdlpError as e:
+            dbg(f"yt-dlp error — {e.reason}")
+            # Bot-blocks are transient — don't negative-cache so they're retried
+            if e.reason != "bot-blocked":
+                _save_caption_cache(video_id, None)
+            return None
+
         if cues:
             dbg(f"yt-dlp success — {len(cues)} cues")
             _save_caption_cache(video_id, cues)
             return cues
-        dbg("yt-dlp returned no cues (check: does the video have captions on YouTube?)")
+        dbg("yt-dlp returned no captions (video may have no English subtitles)")
     else:
         dbg("yt-dlp not found in PATH — skipping (install with: pip install yt-dlp)")
 
     # Cache the negative result so we don't retry this video on future runs.
-    # Exception: if yt-dlp exhausted retries (likely rate-limited), don't cache
-    # so the video is tried again on the next prefetch run.
     _save_caption_cache(video_id, None)
     return None
 
@@ -543,6 +549,13 @@ def _get_captions_via_html_session(video_id: str) -> list[dict] | None:
     return cues if cues else None
 
 
+class YtdlpError(Exception):
+    """Raised when yt-dlp exits with a recognisable error we want to surface."""
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 def _get_captions_via_ytdlp(
     video_id: str,
     cookies_from_browser: str | None = None,
@@ -554,6 +567,10 @@ def _get_captions_via_ytdlp(
     yt-dlp handles YouTube's bot detection, TLS fingerprinting, and
     consent requirements better than any pure-Python HTTP approach.
     This function is a no-op if yt-dlp is not found in PATH.
+
+    Raises YtdlpError with a short reason string when yt-dlp exits with a
+    recognisable error (bot block, private/deleted video, etc.) so callers
+    can surface the reason rather than silently caching a negative result.
 
     Args:
         cookies_from_browser: Browser name to extract cookies from, e.g. "chrome",
@@ -583,7 +600,7 @@ def _get_captions_via_ytdlp(
                     "--sub-langs", "en.*",
                     "--skip-download",
                     "--no-playlist",
-                    "--quiet",
+                    "--no-warnings",      # suppress banner/progress but keep errors
                     "-o", out_tmpl,
                 ]
                 if cookies_from_browser:
@@ -600,14 +617,32 @@ def _get_captions_via_ytdlp(
                     check=False,
                 )
 
-                # Detect rate-limiting: retry after a back-off
                 stdout = getattr(proc, "stdout", "") or ""
                 stderr = getattr(proc, "stderr", "") or ""
                 combined = (stdout + stderr).lower()
+
+                # Detect rate-limiting → retry with exponential back-off
                 if "http error 429" in combined or "too many requests" in combined:
                     wait = 10 * (2 ** attempt)  # 10 s, 20 s, 40 s
                     time.sleep(wait)
-                    continue  # retry
+                    continue
+
+                # Detect permanent errors → raise so caller can log the reason
+                if "sign in to confirm" in combined or "bot" in combined:
+                    raise YtdlpError("bot-blocked")
+                if "private video" in combined:
+                    raise YtdlpError("private")
+                if "video unavailable" in combined or "not available" in combined:
+                    raise YtdlpError("unavailable")
+                if "has been removed" in combined:
+                    raise YtdlpError("deleted")
+                if proc.returncode != 0 and combined.strip():
+                    # Surface first non-empty stderr line for unknown errors
+                    first_err = next(
+                        (ln.strip() for ln in (stdout + stderr).splitlines() if ln.strip()),
+                        "unknown error",
+                    )
+                    raise YtdlpError(first_err[:80])
 
                 for filename in _os.listdir(tmpdir):
                     filepath = _os.path.join(tmpdir, filename)
@@ -624,8 +659,10 @@ def _get_captions_via_ytdlp(
                     if cues:
                         return cues
 
-                return None  # yt-dlp ran but found no captions — not a transient error
+                return None  # yt-dlp ran cleanly but found no captions
 
+        except YtdlpError:
+            raise  # propagate to caller
         except Exception:
             pass
 
@@ -1239,12 +1276,15 @@ def main():
             vid = tc["videoId"]
             if _caption_cache_path(vid).exists():
                 return vid, "cached"
-            cues = get_captions_for_video(
-                vid,
-                cookies_from_browser=args.cookies_from_browser,
-                cookies_file=args.cookies_file,
-            )
-            return vid, f"{len(cues)} cues" if cues else "no captions"
+            try:
+                cues = get_captions_for_video(
+                    vid,
+                    cookies_from_browser=args.cookies_from_browser,
+                    cookies_file=args.cookies_file,
+                )
+                return vid, f"{len(cues)} cues" if cues else "no captions"
+            except YtdlpError as e:
+                return vid, f"yt-dlp error: {e.reason}"
 
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {pool.submit(fetch_one, tc): tc for tc in test_cases}
