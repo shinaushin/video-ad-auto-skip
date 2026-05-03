@@ -581,14 +581,28 @@ def _get_captions_via_ytdlp(
             cookies_from_browser when you can't extract from the browser directly.
     """
     import shutil
-    import subprocess
-    import tempfile
-    import os as _os
 
     if not shutil.which("yt-dlp"):
         return None
 
-    # Retry up to 3 times to handle transient rate limits (HTTP 429)
+    # Prefer the Python API (same package as the CLI) — it lets us access
+    # subtitle data directly without the file-write / client-abort issues
+    # that plague the subprocess approach.
+    try:
+        import yt_dlp as _yt_dlp
+        return _get_captions_via_ytdlp_api(
+            video_id,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
+        )
+    except ImportError:
+        pass  # fall through to subprocess fallback below
+
+    # ── Subprocess fallback (yt-dlp CLI only, no Python package) ────────
+    import subprocess
+    import tempfile
+    import os as _os
+
     for attempt in range(3):
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -599,41 +613,27 @@ def _get_captions_via_ytdlp(
                 elif cookies_file:
                     auth_args = ["--cookies", cookies_file]
 
-                base_cmd = [
+                cmd = [
                     "yt-dlp",
                     "--write-subs",
                     "--write-auto-subs",
+                    "--sub-langs", "en",
                     "--skip-download",
                     "--no-playlist",
                     "--no-warnings",
-                    # ios client avoids SABR streaming errors and n-challenge failures
-                    # that cause the tv/web clients to abort before writing subtitles.
-                    "--extractor-args", "youtube:player_client=ios",
                     "-o", out_tmpl,
-                ] + auth_args
-
-                url = f"https://www.youtube.com/watch?v={video_id}"
-                cmd = base_cmd + ["--sub-langs", "en", url]
+                ] + auth_args + [f"https://www.youtube.com/watch?v={video_id}"]
 
                 proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                    check=False,
+                    cmd, capture_output=True, text=True, timeout=60, check=False,
                 )
-
                 stdout = getattr(proc, "stdout", "") or ""
                 stderr = getattr(proc, "stderr", "") or ""
                 combined = (stdout + stderr).lower()
 
-                # Rate-limit → retry with back-off
                 if "http error 429" in combined or "too many requests" in combined:
-                    wait = 10 * (2 ** attempt)
-                    time.sleep(wait)
+                    time.sleep(10 * (2 ** attempt))
                     continue
-
-                # Permanent errors → raise immediately
                 if "sign in to confirm" in combined or "bot" in combined:
                     raise YtdlpError("bot-blocked")
                 if "private video" in combined:
@@ -642,22 +642,8 @@ def _get_captions_via_ytdlp(
                     raise YtdlpError("unavailable")
                 if "has been removed" in combined:
                     raise YtdlpError("deleted")
-                if proc.returncode != 0 and combined.strip():
-                    first_err = next(
-                        (ln.strip() for ln in (stdout + stderr).splitlines() if ln.strip()),
-                        "unknown error",
-                    )
-                    raise YtdlpError(first_err[:80])
 
-                files = sorted(_os.listdir(tmpdir))
-                if not files:
-                    # Nothing written — log yt-dlp output so we can diagnose
-                    for line in (stdout + stderr).splitlines():
-                        line = line.strip()
-                        if line and not line.startswith("[debug]"):
-                            print(f"    [yt-dlp] {line}", flush=True)
-
-                for filename in files:
+                for filename in sorted(_os.listdir(tmpdir)):
                     filepath = _os.path.join(tmpdir, filename)
                     try:
                         with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
@@ -674,15 +660,115 @@ def _get_captions_via_ytdlp(
                         cues = _parse_caption_xml(content) or _parse_caption_json(content)
                     if cues:
                         return cues
-
-                return None  # yt-dlp ran cleanly but found no English captions
+                return None
 
         except YtdlpError:
-            raise  # propagate to caller
+            raise
         except Exception:
             pass
 
-    return None  # all retries exhausted (likely persistent rate limit)
+    return None
+
+
+def _get_captions_via_ytdlp_api(
+    video_id: str,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+) -> list[dict] | None:
+    """
+    Fetch captions using the yt-dlp Python API (import yt_dlp).
+
+    This bypasses the subprocess file-write approach entirely: we call
+    yt-dlp's extract_info() and read subtitle URLs directly from the
+    returned info dict, then fetch and parse the VTT content ourselves.
+    Avoids SABR abort issues, client selection problems, and temp-file races.
+    """
+    import yt_dlp as _yt_dlp
+    import urllib.request as _urllib_request
+
+    ydl_opts: dict = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en"],
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        # Try multiple clients so at least one returns subtitle metadata.
+        # web_creator is less restricted than plain web and handles SABR better.
+        "extractor_args": {"youtube": {"player_client": ["web_creator", "ios", "web"]}},
+    }
+    if cookies_from_browser:
+        ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    elif cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
+
+    try:
+        with _yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            info = ydl.extract_info(url, download=False)
+    except _yt_dlp.utils.DownloadError as e:
+        msg = str(e).lower()
+        if "429" in msg or "too many requests" in msg:
+            raise YtdlpError("rate-limited")
+        if "private" in msg:
+            raise YtdlpError("private")
+        if "unavailable" in msg or "not available" in msg:
+            raise YtdlpError("unavailable")
+        if "removed" in msg:
+            raise YtdlpError("deleted")
+        if "sign in" in msg or "bot" in msg:
+            raise YtdlpError("bot-blocked")
+        raise YtdlpError(str(e)[:80])
+    except Exception as e:
+        raise YtdlpError(str(e)[:80])
+
+    if not info:
+        return None
+
+    # Collect subtitle track candidates: manual subs + auto-generated
+    # Both dicts map lang_code → list of format dicts with "url" and "ext".
+    candidates: list[dict] = []
+    for sub_dict in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
+        for lang, formats in sub_dict.items():
+            if not lang.startswith("en"):
+                continue
+            for fmt in (formats or []):
+                if fmt.get("url"):
+                    candidates.append(fmt)
+
+    if not candidates:
+        return None
+
+    # Prefer vtt > json3 > srv3 > anything else
+    def _fmt_rank(f: dict) -> int:
+        return {"vtt": 0, "json3": 1, "srv3": 2}.get(f.get("ext", ""), 99)
+
+    candidates.sort(key=_fmt_rank)
+
+    for fmt in candidates:
+        url = fmt.get("url", "")
+        ext = fmt.get("ext", "")
+        if not url:
+            continue
+        try:
+            req = _urllib_request.Request(url, headers={"User-Agent": BROWSER_UA})
+            with _urllib_request.urlopen(req, timeout=15) as resp:
+                content = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if ext == "vtt":
+            cues = _parse_caption_vtt(content)
+        elif ext in ("json3", "srv3"):
+            cues = _parse_caption_json(content)
+        else:
+            cues = _parse_caption_xml(content) or _parse_caption_json(content)
+
+        if cues:
+            return cues
+
+    return None
 
 
 def _parse_caption_vtt(text: str) -> list[dict] | None:
