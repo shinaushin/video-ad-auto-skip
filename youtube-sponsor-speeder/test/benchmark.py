@@ -687,15 +687,10 @@ def _get_captions_via_ytdlp_api(
     import urllib.request as _urllib_request
 
     ydl_opts: dict = {
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["en"],
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # Try multiple clients so at least one returns subtitle metadata.
-        # web_creator is less restricted than plain web and handles SABR better.
+        # Try multiple clients; web_creator + ios avoid SABR format errors.
         "extractor_args": {"youtube": {"player_client": ["web_creator", "ios", "web"]}},
     }
     if cookies_from_browser:
@@ -706,7 +701,10 @@ def _get_captions_via_ytdlp_api(
     try:
         with _yt_dlp.YoutubeDL(ydl_opts) as ydl:
             url = f"https://www.youtube.com/watch?v={video_id}"
-            info = ydl.extract_info(url, download=False)
+            # process=False skips format selection entirely — subtitle URLs are
+            # populated by the extractor before that step, so we get them without
+            # triggering the "Requested format is not available" SABR error.
+            info = ydl.extract_info(url, download=False, process=False)
     except _yt_dlp.utils.DownloadError as e:
         msg = str(e).lower()
         if "429" in msg or "too many requests" in msg:
