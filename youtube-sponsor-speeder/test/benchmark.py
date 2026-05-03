@@ -606,7 +606,9 @@ def _get_captions_via_ytdlp(
                     "--skip-download",
                     "--no-playlist",
                     "--no-warnings",
-                    "--ignore-errors",   # continue past format errors (e.g. SABR/images-only)
+                    # ios client avoids SABR streaming errors and n-challenge failures
+                    # that cause the tv/web clients to abort before writing subtitles.
+                    "--extractor-args", "youtube:player_client=ios",
                     "-o", out_tmpl,
                 ] + auth_args
 
