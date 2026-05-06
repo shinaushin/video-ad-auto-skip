@@ -82,6 +82,12 @@ STRONG_PATTERNS = [
     re.compile(r"coupon code", re.I),
     re.compile(r"exclusive (?:discount|deal|offer|code) (?:for )?(?:my )?(?:viewers?|subscribers?|listeners?|audience)", re.I),
     re.compile(r"(?:my |our )?viewers? (?:get|receive|save|can get)", re.I),
+    # Sponsor disclosure / outro phrases — "thanks to X for sponsoring", etc.
+    re.compile(r"thanks?\s+(?:again\s+)?to\s+[\w\s]{1,30}\s+for\s+sponsor", re.I),
+    re.compile(r"thank\s+[\w]+\s+for\s+(?:sponsor|partner)", re.I),
+    re.compile(r"\bthis\s+(?:video|episode)\s+(?:is\s+)?(?:sponsor|brought)", re.I),
+    re.compile(r"\btoday(?:'s|s)?\s+(?:video\s+)?sponsor\b", re.I),
+    re.compile(r"\bour\s+sponsor(?:s)?\b", re.I),
 ]
 
 WEAK_PATTERNS = [
@@ -102,11 +108,12 @@ WEAK_PATTERNS = [
 # Detection tuning constants
 PADDING_BEFORE       = 3.0   # seconds before first keyword hit to include
 PADDING_AFTER        = 5.0   # seconds after last keyword hit to include
-MERGE_GAP_SEC        = 15    # merge clusters with gaps up to this many seconds
+MERGE_GAP_SEC        = 120   # merge clusters with gaps up to this many seconds
 WINDOW_SEC           = 25    # sliding window width for context-aware scoring
 MIN_SCORE            = 3     # minimum window score to flag (one strong hit = 3)
 MIN_SEGMENT_DURATION = 45.0  # floor: any detected segment is at least this long
 SILENCE_BOUNDARY_SEC = 1.5   # gap between consecutive cues treated as a break
+BOUNDARY_WALK_SEC    = 25    # max seconds to walk past cluster anchor when finding boundaries
 
 # Phrases that signal "sponsor is starting" — used for backward boundary walk
 SPONSOR_INTRO_PATTERNS = [
@@ -157,14 +164,14 @@ def _walk_boundary_back(cues: list[dict], from_idx: int) -> float:
 
     Falls back to cues[from_idx]["start"] if no boundary is found within
     the look-back window (we never walk past the start of the cluster's
-    cue or more than WINDOW_SEC seconds behind it).
+    cue or more than BOUNDARY_WALK_SEC seconds behind it).
     """
     anchor_start = cues[from_idx]["start"]
     best = anchor_start
     for i in range(from_idx, -1, -1):
         cue = cues[i]
-        # Don't walk more than WINDOW_SEC back from the anchor
-        if anchor_start - cue["start"] > WINDOW_SEC:
+        # Don't walk more than BOUNDARY_WALK_SEC back from the anchor
+        if anchor_start - cue["start"] > BOUNDARY_WALK_SEC:
             break
         # Silence gap: gap between cues[i-1].end and cues[i].start
         if i > 0:
@@ -195,8 +202,8 @@ def _walk_boundary_forward(cues: list[dict], from_idx: int) -> float:
     for i in range(from_idx, len(cues)):
         cue = cues[i]
         cue_end = cue["start"] + cue.get("dur", 0)
-        # Don't walk more than WINDOW_SEC forward from the anchor
-        if cue["start"] - anchor_end > WINDOW_SEC:
+        # Don't walk more than BOUNDARY_WALK_SEC forward from the anchor
+        if cue["start"] - anchor_end > BOUNDARY_WALK_SEC:
             break
         best = cue_end
         # Silence gap after this cue
