@@ -623,6 +623,7 @@ def run_batch(
     device: str = "cpu",
     skip_audio: bool = False,
     seed: int = 42,
+    extra_skip: set[str] | None = None,
 ) -> None:
     """Process up to ``n_videos`` random videos and cache their embeddings.
 
@@ -644,11 +645,15 @@ def run_batch(
     all_ids = list(sponsor_map.keys())
     random.seed(seed)
     random.shuffle(all_ids)
-    # Skip already-cached.
-    uncached = [v for v in all_ids if not (cache_dir / f"{v}.npz").exists()]
+    # Skip already-cached and any IDs passed via --skip-ids.
+    skip_set = set(extra_skip) if extra_skip else set()
+    uncached = [v for v in all_ids
+                if not (cache_dir / f"{v}.npz").exists() and v not in skip_set]
     target = uncached[:n_videos]
 
-    log.info("Processing %d videos (%d already cached)", len(target), len(all_ids) - len(uncached))
+    log.info("Processing %d videos (%d already cached, %d skipped by ID list)",
+             len(target), len(all_ids) - len(uncached) - len(skip_set & set(all_ids)),
+             len(skip_set & set(all_ids)))
 
     # Load models once (heavy — done before threading).
     whisper_model = whisper_processor = None
@@ -819,7 +824,14 @@ def main() -> None:
     p.add_argument("--device", default="cpu", help="PyTorch device (cpu or cuda)")
     p.add_argument("--skip-audio", action="store_true", help="Skip yt-dlp download and Whisper (text-only mode)")
     p.add_argument("--seed", type=int, default=42, help="Random seed for video sampling")
+    p.add_argument("--skip-ids", type=Path, default=None,
+                   help="Path to a text file of already-processed video IDs (one per line) to skip.")
     args = p.parse_args()
+
+    extra_skip: set[str] = set()
+    if args.skip_ids and args.skip_ids.exists():
+        extra_skip = {line.strip() for line in args.skip_ids.read_text().splitlines() if line.strip()}
+        log.info("Skipping %d pre-processed video IDs from %s", len(extra_skip), args.skip_ids)
 
     run_batch(
         csv_path=args.csv,
@@ -829,6 +841,7 @@ def main() -> None:
         device=args.device,
         skip_audio=args.skip_audio,
         seed=args.seed,
+        extra_skip=extra_skip,
     )
 
 

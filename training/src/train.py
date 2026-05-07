@@ -45,10 +45,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from data_pipeline import SponsorDataset, MFCC_DIM, N_MFCC_FRAMES, TEXT_DIM
+from data_pipeline import SponsorDataset, N_MFCC_FRAMES
 from models import (
     DISTILBERT_DIM,
+    MFCC_DIM,
     N_FRAMES,
+    TEXT_DIM,
     WHISPER_DIM,
     StudentModel,
     TeacherModel,
@@ -109,26 +111,60 @@ class FocalLoss(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class TeacherWindowDataset(Dataset):
-    """Flat window dataset for teacher training: (text_emb, audio_emb) → label.
+class TeacherSequenceDataset(Dataset):
+    """Video-level sequence dataset for teacher training.
 
-    Each item is a single window (no sequence context).  The BiLSTM in the
-    teacher handles temporal context inside the forward pass, but for batching
-    purposes we treat each window as independent during training.
+    Each item is a full video's ordered sequence of windows:
+        (text_embs [T, 768], audio_embs [T, 384], labels [T])
+
+    Feeding full sequences lets the BiLSTM actually learn temporal context
+    (e.g. a sponsor read spanning multiple consecutive windows).  At inference
+    time the extension processes one window at a time so seq_len=1 degrades
+    gracefully.
     """
 
     def __init__(self, sponsor_ds: SponsorDataset) -> None:
-        self._items: list[dict] = list(sponsor_ds)
+        items_by_video: dict[str, list[dict]] = {}
+        for item in sponsor_ds:
+            items_by_video.setdefault(item["video_id"], []).append(item)
+        self._sequences: list[list[dict]] = list(items_by_video.values())
 
     def __len__(self) -> int:
-        return len(self._items)
+        return len(self._sequences)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        item = self._items[idx]
-        text_emb = torch.from_numpy(item["text_emb"])     # [768]
-        audio_emb = torch.from_numpy(item["audio_emb"])   # [384]
-        label = torch.tensor(item["label"], dtype=torch.float32)
-        return text_emb, audio_emb, label
+        windows = self._sequences[idx]
+        text_embs = torch.stack(
+            [torch.from_numpy(w["text_emb"]) for w in windows]
+        )                                                                      # [T, 768]
+        audio_embs = torch.stack(
+            [torch.from_numpy(w["audio_emb"]) for w in windows]
+        )                                                                      # [T, 384]
+        labels = torch.tensor(
+            [w["label"] for w in windows], dtype=torch.float32
+        )                                                                      # [T]
+        return text_embs, audio_embs, labels
+
+
+def collate_teacher_sequences(
+    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad variable-length video sequences to the longest one in the batch.
+
+    Returns:
+        text_padded   [B, T_max, 768]
+        audio_padded  [B, T_max, 384]
+        labels_padded [B, T_max]  — padding positions marked with -1.0
+        lengths       [B]         — true sequence length per video
+    """
+    text_list, audio_list, label_list = zip(*batch)
+    lengths = torch.tensor([t.shape[0] for t in text_list], dtype=torch.long)
+    text_padded = nn.utils.rnn.pad_sequence(text_list, batch_first=True)          # [B, T_max, 768]
+    audio_padded = nn.utils.rnn.pad_sequence(audio_list, batch_first=True)        # [B, T_max, 384]
+    labels_padded = nn.utils.rnn.pad_sequence(
+        label_list, batch_first=True, padding_value=-1.0
+    )                                                                               # [B, T_max]
+    return text_padded, audio_padded, labels_padded, lengths
 
 
 class StudentWindowDataset(Dataset):
@@ -216,6 +252,22 @@ def make_balanced_sampler(labels: list[int]) -> WeightedRandomSampler:
 # ---------------------------------------------------------------------------
 
 
+def _eval_metrics(
+    all_preds: list[int], all_labels: list[int]
+) -> dict[str, float]:
+    """Compute precision, recall, F1, and accuracy from flat lists."""
+    tp = sum(p == 1 and l == 1 for p, l in zip(all_preds, all_labels))
+    fp = sum(p == 1 and l == 0 for p, l in zip(all_preds, all_labels))
+    fn = sum(p == 0 and l == 1 for p, l in zip(all_preds, all_labels))
+    tn = sum(p == 0 and l == 0 for p, l in zip(all_preds, all_labels))
+    precision = tp / max(tp + fp, 1)
+    recall    = tp / max(tp + fn, 1)
+    f1        = 2 * precision * recall / max(precision + recall, 1e-9)
+    accuracy  = (tp + tn) / max(len(all_preds), 1)
+    return {"precision": precision, "recall": recall, "f1": f1, "accuracy": accuracy,
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
 def _run_teacher_epoch(
     model: TeacherModel,
     loader: DataLoader,
@@ -223,26 +275,42 @@ def _run_teacher_epoch(
     criterion: FocalLoss,
     device: str,
     train: bool,
-) -> tuple[float, float]:
-    """Run one epoch; return (mean_loss, accuracy)."""
+) -> tuple[float, dict[str, float]]:
+    """Run one epoch over padded video sequences.
+
+    Each batch item is a full video sequence (variable length).  Padded
+    positions (label == -1) are masked out before computing loss and metrics.
+
+    Returns:
+        mean_loss   float
+        metrics     dict with precision / recall / f1 / accuracy
+    """
     model.train(train)
     total_loss = 0.0
-    correct = 0
-    total = 0
+    all_preds:  list[int]   = []
+    all_labels: list[int]   = []
+    all_probs:  list[float] = []
 
     with torch.set_grad_enabled(train):
-        for text_emb, audio_emb, labels in loader:
-            text_emb = text_emb.to(device)    # [B, 768]
-            audio_emb = audio_emb.to(device)  # [B, 384]
-            labels = labels.to(device)         # [B]
+        for text_emb, audio_emb, labels, lengths in loader:
+            # text_emb  [B, T, 768]
+            # audio_emb [B, T, 384]
+            # labels    [B, T]  (-1 for padded positions)
+            # lengths   [B]
+            text_emb  = text_emb.to(device)
+            audio_emb = audio_emb.to(device)
+            labels    = labels.to(device)
+            lengths   = lengths.to(device)
 
-            # Teacher expects [batch, seq_len, dim]; treat each window as seq_len=1.
-            text_in = text_emb.unsqueeze(1)    # [B, 1, 768]
-            audio_in = audio_emb.unsqueeze(1)  # [B, 1, 384]
-            logits = model(text_in, audio_in)  # [B, 1, 1]
-            logits = logits.squeeze(-1).squeeze(-1)  # [B]
+            logits = model(text_emb, audio_emb, lengths)  # [B, T, 1]
+            logits = logits.squeeze(-1)                   # [B, T]
 
-            loss = criterion(logits, labels)
+            # Mask padded positions.
+            mask         = labels >= 0                    # [B, T]
+            logits_valid = logits[mask]                   # [N_valid]
+            labels_valid = labels[mask]                   # [N_valid]
+
+            loss = criterion(logits_valid, labels_valid)
 
             if train and optimizer is not None:
                 optimizer.zero_grad()
@@ -250,12 +318,95 @@ def _run_teacher_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-            total_loss += loss.item() * len(labels)
-            preds = (torch.sigmoid(logits) > 0.5).long()
-            correct += (preds == labels.long()).sum().item()
-            total += len(labels)
+            n_valid = mask.sum().item()
+            total_loss += loss.item() * n_valid
+            probs = torch.sigmoid(logits_valid).cpu().tolist()
+            preds = [int(p > 0.5) for p in probs]
+            all_probs.extend(probs)
+            all_preds.extend(preds)
+            all_labels.extend(labels_valid.long().cpu().tolist())
 
-    return total_loss / max(total, 1), correct / max(total, 1)
+    n = max(len(all_labels), 1)
+    metrics = _eval_metrics(all_preds, all_labels)
+
+    # Log probability distributions so we can detect "model outputs nothing > 0.5"
+    # even when F1=0 — helps tune the decision threshold.
+    pos_probs = [p for p, l in zip(all_probs, all_labels) if l == 1]
+    neg_probs = [p for p, l in zip(all_probs, all_labels) if l == 0]
+    metrics["mean_prob_pos"] = float(sum(pos_probs) / max(len(pos_probs), 1))
+    metrics["mean_prob_neg"] = float(sum(neg_probs) / max(len(neg_probs), 1))
+    metrics["max_prob_pos"]  = float(max(pos_probs)) if pos_probs else 0.0
+
+    return total_loss / n, metrics
+
+
+def _eval_teacher_with_thresholds(
+    model: TeacherModel,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+) -> tuple[float, dict[str, float], list[dict]]:
+    """Evaluate the teacher model and scan decision thresholds.
+
+    Identical to ``_run_teacher_epoch(train=False)`` but also returns a
+    threshold curve so the caller can find the decision cutoff that maximises
+    F1 without retraining.
+
+    Returns:
+        loss             float
+        metrics          dict  (precision / recall / f1 at threshold=0.5)
+        threshold_curve  list of {"threshold": t, "f1": f, "precision": p, "recall": r}
+                         for t in 0.05 … 0.90 (step 0.05)
+    """
+    model.eval()
+    total_loss  = 0.0
+    all_probs:  list[float] = []
+    all_labels: list[int]   = []
+
+    with torch.no_grad():
+        for text_emb, audio_emb, labels, lengths in loader:
+            text_emb  = text_emb.to(device)
+            audio_emb = audio_emb.to(device)
+            labels    = labels.to(device)
+            lengths   = lengths.to(device)
+
+            logits = model(text_emb, audio_emb, lengths).squeeze(-1)
+            mask         = labels >= 0
+            logits_valid = logits[mask]
+            labels_valid = labels[mask]
+
+            loss = criterion(logits_valid, labels_valid)
+            total_loss += loss.item() * mask.sum().item()
+
+            probs = torch.sigmoid(logits_valid).cpu().tolist()
+            all_probs.extend(probs)
+            all_labels.extend(labels_valid.long().cpu().tolist())
+
+    n = max(len(all_labels), 1)
+
+    # Metrics at the default 0.5 threshold.
+    preds_50 = [int(p > 0.5) for p in all_probs]
+    metrics   = _eval_metrics(preds_50, all_labels)
+    pos_probs = [p for p, l in zip(all_probs, all_labels) if l == 1]
+    neg_probs = [p for p, l in zip(all_probs, all_labels) if l == 0]
+    metrics["mean_prob_pos"] = float(sum(pos_probs) / max(len(pos_probs), 1))
+    metrics["mean_prob_neg"] = float(sum(neg_probs) / max(len(neg_probs), 1))
+    metrics["max_prob_pos"]  = float(max(pos_probs)) if pos_probs else 0.0
+
+    # Threshold scan: every 0.05 from 0.05 to 0.90.
+    curve: list[dict] = []
+    for t_int in range(1, 19):           # 1 … 18  →  0.05 … 0.90
+        t = round(t_int / 20, 2)
+        preds = [int(p > t) for p in all_probs]
+        m     = _eval_metrics(preds, all_labels)
+        curve.append({
+            "threshold": t,
+            "f1":        round(m["f1"],        4),
+            "precision": round(m["precision"], 4),
+            "recall":    round(m["recall"],    4),
+        })
+
+    return total_loss / n, metrics, curve
 
 
 def train_teacher(cfg: dict, device: str) -> Path:
@@ -264,93 +415,173 @@ def train_teacher(cfg: dict, device: str) -> Path:
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    epochs = int(cfg.get("epochs", 30))
-    batch_size = int(cfg.get("batch_size", 64))
-    lr = float(cfg.get("lr", 1e-3))
+    epochs       = int(cfg.get("epochs", 30))
+    # seq_batch_size = videos per batch (each video is a full window sequence).
+    seq_batch    = int(cfg.get("seq_batch_size", 8))
+    lr           = float(cfg.get("lr", 1e-3))
     weight_decay = float(cfg.get("weight_decay", 1e-4))
-    patience = int(cfg.get("patience", 5))
-    focal_gamma = float(cfg.get("focal_gamma", 2.0))
-    focal_alpha = float(cfg.get("focal_alpha", 0.25))
+    patience     = int(cfg.get("patience", 5))
 
     train_ids, val_ids, test_ids = SponsorDataset.train_val_test_split(cache_dir)
+    log.info("Split: %d train / %d val / %d test videos",
+             len(train_ids), len(val_ids), len(test_ids))
 
-    train_ds = TeacherWindowDataset(SponsorDataset(cache_dir, train_ids))
-    val_ds = TeacherWindowDataset(SponsorDataset(cache_dir, val_ids))
+    train_ds = TeacherSequenceDataset(SponsorDataset(cache_dir, train_ids))
+    val_ds   = TeacherSequenceDataset(SponsorDataset(cache_dir, val_ids))
 
-    train_labels = [int(d[2].item()) for d in train_ds]
-    sampler = make_balanced_sampler(train_labels)
+    # Compute actual class ratio from training data for pos_weight.
+    n_pos = sum(w["label"] for seq in train_ds._sequences for w in seq)
+    n_neg = sum(1 - w["label"] for seq in train_ds._sequences for w in seq)
+    base_pw       = n_neg / max(n_pos, 1)
+    # pos_weight_mult scales the computed ratio (Optuna tunes this).
+    # pos_weight overrides the whole value directly (manual control).
+    pw_mult       = float(cfg.get("pos_weight_mult", 1.0))
+    pos_weight_val = float(cfg.get("pos_weight", base_pw * pw_mult))
+    log.info(
+        "Class counts — pos: %d  neg: %d  base_pw=%.1f  mult=%.2f  → pos_weight=%.1f",
+        n_pos, n_neg, base_pw, pw_mult, pos_weight_val,
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    # Weight each video by whether it contains at least one sponsor window.
+    # This up-samples videos that have sponsor content.
+    train_has_sponsor = [int(any(w["label"] for w in seq)) for seq in train_ds._sequences]
+    sampler = make_balanced_sampler(train_has_sponsor)
 
-    model = build_teacher(device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    train_loader = DataLoader(
+        train_ds, batch_size=seq_batch, sampler=sampler,
+        collate_fn=collate_teacher_sequences, num_workers=0,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=seq_batch, shuffle=False,
+        collate_fn=collate_teacher_sequences, num_workers=0,
+    )
+
+    # Allow Optuna best_params.json to be pasted directly into the config.
+    lstm_hidden = int(cfg.get("lstm_hidden", 192))
+    dropout     = float(cfg.get("dropout", 0.1))
+    model       = TeacherModel(lstm_hidden=lstm_hidden, dropout=dropout).to(device)
+    optimizer   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
-    criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+    # BCEWithLogitsLoss + pos_weight is more direct than FocalLoss for severe
+    # class imbalance: it scales the positive-class gradient by the actual
+    # neg/pos ratio, forcing the model to treat each sponsor window as worth
+    # pos_weight non-sponsor windows.
+    criterion = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([pos_weight_val], device=device)
+    )
 
-    best_val_loss = float("inf")
+    best_val_f1      = -1.0   # track F1; higher = better (prevents collapse to all-zero)
+    best_val_loss    = float("inf")  # kept for logging only
     epochs_no_improve = 0
-    best_ckpt = output_dir / "teacher_best.pt"
+    best_ckpt        = output_dir / "teacher_best.pt"
 
     training_log: dict = {
         "phase": "teacher",
+        "n_train_videos": len(train_ids),
+        "n_val_videos": len(val_ids),
+        "n_test_videos": len(test_ids),
         "epochs": [],
         "best_epoch": 0,
+        "best_val_f1": 0.0,
         "best_val_loss": float("inf"),
     }
 
-    log.info("Starting teacher training for %d epochs", epochs)
+    log.info("Starting teacher training: %d epochs, %d videos/batch, pos_weight=%.1f",
+             epochs, seq_batch, pos_weight_val)
+    log.info("Early stopping: patience=%d epochs on val_f1 (not val_loss)", patience)
+
     for epoch in range(1, epochs + 1):
         t0 = time.time()
-        train_loss, train_acc = _run_teacher_epoch(
+        train_loss, train_m = _run_teacher_epoch(
             model, train_loader, optimizer, criterion, device, train=True
         )
-        val_loss, val_acc = _run_teacher_epoch(
+        val_loss, val_m = _run_teacher_epoch(
             model, val_loader, None, criterion, device, train=False
         )
         scheduler.step(val_loss)
-
         elapsed = time.time() - t0
+
         log.info(
-            "Epoch %2d/%d  train_loss=%.4f  train_acc=%.3f  val_loss=%.4f  val_acc=%.3f  %.1fs",
-            epoch, epochs, train_loss, train_acc, val_loss, val_acc, elapsed,
+            "Epoch %2d/%d  "
+            "train_loss=%.4f f1=%.3f p(+)=%.3f p(-)=%.3f  |  "
+            "val_loss=%.4f f1=%.3f p=%.3f r=%.3f  p(+)=%.3f  %.1fs",
+            epoch, epochs,
+            train_loss, train_m["f1"],
+            train_m["mean_prob_pos"], train_m["mean_prob_neg"],
+            val_loss, val_m["f1"],
+            val_m["precision"], val_m["recall"],
+            val_m["mean_prob_pos"], elapsed,
         )
 
         ep_entry = {
             "epoch": epoch,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "val_loss": val_loss,
-            "val_acc": val_acc,
+            "train_loss": train_loss, **{f"train_{k}": v for k, v in train_m.items()},
+            "val_loss":   val_loss,   **{f"val_{k}":   v for k, v in val_m.items()},
         }
         training_log["epochs"].append(ep_entry)
 
-        if val_loss < best_val_loss:
+        val_f1 = val_m["f1"]
+        # Use val_f1 strictly for early stopping — no val_loss tiebreak.
+        # A tiebreak on val_loss would reset patience every epoch when f1=0
+        # (loss slowly decreases toward the all-negative optimum), preventing
+        # the model from ever stopping early during class collapse.
+        improved = val_f1 > best_val_f1
+        if improved:
+            best_val_f1  = val_f1
             best_val_loss = val_loss
             epochs_no_improve = 0
             training_log["best_epoch"] = epoch
+            training_log["best_val_f1"]   = best_val_f1
             training_log["best_val_loss"] = best_val_loss
             torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "epoch": epoch,
-                    "val_loss": val_loss,
-                    "config": cfg,
-                },
+                {"model_state_dict": model.state_dict(),
+                 "epoch": epoch, "val_loss": val_loss, "val_f1": val_f1, "config": cfg},
                 best_ckpt,
             )
-            log.info("  ✓ Best checkpoint saved (val_loss=%.4f)", val_loss)
+            log.info("  ✓ Best checkpoint saved (val_f1=%.3f  val_loss=%.4f)", val_f1, val_loss)
         else:
             epochs_no_improve += 1
-            log.info("  No improvement (%d/%d)", epochs_no_improve, patience)
+            log.info("  No improvement (%d/%d)  best_val_f1=%.3f", epochs_no_improve, patience, best_val_f1)
             if epochs_no_improve >= patience:
                 log.info("Early stopping triggered.")
                 break
 
-    log.path = str(best_ckpt)
+    # ── Final evaluation on the held-out test split (with threshold scan) ───
+    log.info("Loading best checkpoint for test-set evaluation…")
+    state = torch.load(best_ckpt, map_location=device)
+    model.load_state_dict(state["model_state_dict"])
+
+    test_ds     = TeacherSequenceDataset(SponsorDataset(cache_dir, test_ids))
+    test_loader = DataLoader(
+        test_ds, batch_size=seq_batch, shuffle=False,
+        collate_fn=collate_teacher_sequences, num_workers=0,
+    )
+    test_loss, test_m, threshold_curve = _eval_teacher_with_thresholds(
+        model, test_loader, criterion, device
+    )
+    best_thresh_entry = max(threshold_curve, key=lambda x: x["f1"])
+    log.info(
+        "Test (thresh=0.50)  loss=%.4f  p=%.3f  r=%.3f  f1=%.3f",
+        test_loss, test_m["precision"], test_m["recall"], test_m["f1"],
+    )
+    log.info(
+        "Test (best thresh=%.2f)  p=%.3f  r=%.3f  f1=%.3f  ← use this threshold at inference",
+        best_thresh_entry["threshold"],
+        best_thresh_entry["precision"],
+        best_thresh_entry["recall"],
+        best_thresh_entry["f1"],
+    )
+    training_log["test"] = {
+        "test_loss": test_loss,
+        **{f"test_{k}": v for k, v in test_m.items()},
+        "threshold_curve":     threshold_curve,
+        "best_threshold":      best_thresh_entry["threshold"],
+        "best_threshold_f1":   best_thresh_entry["f1"],
+    }
+
     log_path = output_dir / "training_log.json"
     log_path.write_text(json.dumps(training_log, indent=2))
-    log.info("Training log written to %s", log_path)
+    log.info("Training log → %s", log_path)
     return best_ckpt
 
 

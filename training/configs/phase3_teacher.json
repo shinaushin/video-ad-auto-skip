@@ -4,13 +4,11 @@
   "description": "Train teacher model (DistilBERT + Whisper-tiny + CrossAttention + BiLSTM).",
   "cache_dir": "/kaggle/working/embeddings_cache",
   "output_dir": "/kaggle/working/outputs",
-  "epochs": 30,
-  "batch_size": 64,
-  "lr": 1e-3,
+  "epochs": 200,
+  "seq_batch_size": 8,
+  "lr": 5e-4,
   "weight_decay": 1e-4,
-  "patience": 5,
-  "focal_gamma": 2.0,
-  "focal_alpha": 0.25,
+  "patience": 15,
   "device": "auto",
   "seed": 42
 }

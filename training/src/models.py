@@ -102,7 +102,7 @@ class TeacherModel(nn.Module):
         proj_dim: int = PROJ_DIM,
         lstm_hidden: int = 192,
         lstm_layers: int = 2,
-        dropout: float = 0.3,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
 
