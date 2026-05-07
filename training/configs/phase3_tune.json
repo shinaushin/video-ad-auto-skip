@@ -1,0 +1,12 @@
+{
+  "name": "yt-sponsor-phase3-tune",
+  "phase": "tune",
+  "description": "Optuna hyperparameter search for teacher model (DistilBERT + Whisper + CrossAttention + BiLSTM).",
+  "cache_dir": "/kaggle/working/embeddings_cache",
+  "output_dir": "/kaggle/working/outputs",
+  "n_trials": 20,
+  "tune_epochs": 40,
+  "tune_patience": 8,
+  "device": "auto",
+  "seed": 42
+}
