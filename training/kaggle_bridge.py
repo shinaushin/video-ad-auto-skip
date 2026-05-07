@@ -102,7 +102,7 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-_DEFAULT_USERNAME = "your_kaggle_username"
+_DEFAULT_USERNAME = "profileurlplz"
 
 #: Kaggle Dataset slug for the per-video embedding cache (phases 1 → 2-5).
 _EMBEDDINGS_DATASET_SLUG = "yt-sponsor-embeddings-cache"
@@ -111,10 +111,13 @@ _EMBEDDINGS_DATASET_SLUG = "yt-sponsor-embeddings-cache"
 _TEACHER_CKPT_DATASET_SLUG = "yt-sponsor-teacher-checkpoint"
 
 POLL_INTERVAL_SEC = 30
-MAX_WAIT_SEC = 7200  # 2 hours — ample for 300-video embedding + 30-epoch training
+MAX_WAIT_SEC = 14400  # 4 hours — covers 500-video batches + accumulate seed copy
 
 _TRAINING_ROOT = Path(__file__).resolve().parent          # training/
 _PROJECT_ROOT = _TRAINING_ROOT.parent                     # repo root
+
+#: Persistent local directory that accumulates all .npz files across every batch run.
+_MASTER_CACHE_DIR = _TRAINING_ROOT / "cache" / "embeddings"
 
 log = logging.getLogger(__name__)
 
@@ -128,21 +131,129 @@ def _log(msg: str) -> None:
     print(f"[bridge {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _merge_into_master_cache(source_dir: Path) -> int:
+    """Copy any new .npz files from source_dir into the persistent master cache.
+
+    Returns the new master cache total.
+    """
+    _MASTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    added = 0
+    for f in source_dir.glob("*.npz"):
+        dst = _MASTER_CACHE_DIR / f.name
+        if not dst.exists():
+            import shutil as _shutil
+            _shutil.copy2(f, dst)
+            added += 1
+    total = sum(1 for _ in _MASTER_CACHE_DIR.glob("*.npz"))
+    if added:
+        _log(f"Master cache: +{added} new files → {total} total")
+    return total
+
+
+def _print_cache_total(kaggle_total: int | None = None, label: str = "Cache total") -> None:
+    """Print a banner showing the current cache totals.
+
+    kaggle_total: count reported by the in-kernel summary JSON (reflects Kaggle dataset).
+    Falls back to the master cache dir count if not provided.
+    """
+    local_count = sum(1 for _ in _MASTER_CACHE_DIR.glob("*.npz")) if _MASTER_CACHE_DIR.is_dir() else 0
+    _log("=" * 50)
+    if kaggle_total is not None:
+        _log(f"  {label}")
+        _log(f"    Kaggle dataset : {kaggle_total} videos")
+        _log(f"    Local master   : {local_count} videos")
+    else:
+        _log(f"  {label}: {local_count} videos (local master cache)")
+    _log("=" * 50)
+
+
+def _whoami(token: str) -> str | None:
+    """Ask the Kaggle API who owns this token. Returns username or None on failure."""
+    import urllib.request as _req
+    import base64 as _b64
+    # The /whoami endpoint accepts Basic auth with any username + token as password,
+    # or Bearer token — try Bearer first (works with new access_token format).
+    for auth_header in (
+        f"Bearer {token}",
+        "Basic " + _b64.b64encode(f":{token}".encode()).decode(),
+    ):
+        try:
+            req = _req.Request(
+                "https://www.kaggle.com/api/v1/whoami",
+                headers={"Authorization": auth_header, "Accept": "application/json"},
+            )
+            with _req.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                username = data.get("username") or data.get("name") or data.get("displayName")
+                if username:
+                    return username.strip()
+        except Exception:
+            pass
+    return None
+
+
 def _kaggle_username() -> str:
     username = os.environ.get("KAGGLE_USERNAME", "").strip()
+    # Fallback 1: read from kaggle.json (has username even when access_token is used for key)
+    if not username or username == "your_kaggle_username":
+        p_json = Path.home() / ".kaggle" / "kaggle.json"
+        if p_json.exists():
+            try:
+                username = json.loads(p_json.read_text()).get("username", "").strip()
+            except (json.JSONDecodeError, KeyError):
+                pass
+    # Fallback 2: auto-fetch from Kaggle API using the token
+    if not username or username == "your_kaggle_username":
+        token = os.environ.get("KAGGLE_API_TOKEN") or _read_token_file_raw()
+        if token:
+            _log("Resolving username via Kaggle API…")
+            fetched = _whoami(token)
+            if fetched:
+                _log(f"  resolved username: '{fetched}'")
+                username = fetched
+    # Fallback 3: module constant
     if not username or username == "your_kaggle_username":
         username = _DEFAULT_USERNAME
     if not username or username == "your_kaggle_username":
-        print("\nKaggle username not configured.")
+        print("\nKaggle username not configured and /whoami lookup failed.")
         print("  export KAGGLE_USERNAME=your_username")
         print(f"  or edit _DEFAULT_USERNAME in {__file__}")
         sys.exit(1)
     return username
 
 
+def _read_token_file_raw() -> str | None:
+    """Read just the raw token bytes without side-effects (no env var mutation)."""
+    p_new = Path.home() / ".kaggle" / "access_token"
+    if p_new.exists():
+        return p_new.read_text().strip()
+    p_json = Path.home() / ".kaggle" / "kaggle.json"
+    if p_json.exists():
+        try:
+            return json.loads(p_json.read_text()).get("key")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return None
+
+
 def _read_token_file() -> str | None:
-    p = Path.home() / ".kaggle" / "access_token"
-    return p.read_text().strip() if p.exists() else None
+    """Read API key from ~/.kaggle/access_token (new format) or kaggle.json (classic)."""
+    # New-style single-token file
+    p_new = Path.home() / ".kaggle" / "access_token"
+    if p_new.exists():
+        return p_new.read_text().strip()
+    # Classic kaggle.json: {"username": "...", "key": "..."}
+    p_json = Path.home() / ".kaggle" / "kaggle.json"
+    if p_json.exists():
+        try:
+            creds = json.loads(p_json.read_text())
+            # Also set username from the JSON so _kaggle_username() finds it.
+            if "username" in creds and not os.environ.get("KAGGLE_USERNAME"):
+                os.environ["KAGGLE_USERNAME"] = creds["username"]
+            return creds.get("key")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return None
 
 
 def _kaggle_cmd(*args: str) -> subprocess.CompletedProcess[str]:
@@ -187,56 +298,94 @@ def _bundle_source(dest_tar: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+_SHARD_SIZE = 100   # files per shard — well below Kaggle's per-version limit
+
+
 def _upload_dataset(
     data_dir: Path,
     username: str,
     slug: str,
     title: str,
 ) -> str:
-    """Upload or update a local directory as a Kaggle Dataset.
+    """Upload a local directory as one or more sharded Kaggle Datasets.
 
-    Returns the dataset reference ``"<username>/<slug>"``.
+    Kaggle silently truncates dataset versions that contain more than ~100-200
+    files.  We work around this by splitting the files into shards of
+    _SHARD_SIZE each and uploading each shard to a separate dataset slug:
+        <slug>          (shard 0: files 0..99)
+        <slug>-s1       (shard 1: files 100..199)
+        <slug>-s2       (shard 2: files 200..299)
+        …
+
+    The mount cell in the kernel combines all shards transparently.
+
+    Returns the primary dataset reference ``"<username>/<slug>"``.
     """
-    ref = f"{username}/{slug}"
-    _log(f"Uploading dataset '{ref}'…")
-    _log(f"  source: {data_dir}")
+    all_files = sorted(f for f in data_dir.iterdir() if f.is_file())
+    n_files    = len(all_files)
+    n_shards   = max(1, (n_files + _SHARD_SIZE - 1) // _SHARD_SIZE)
 
-    with tempfile.TemporaryDirectory(prefix="kaggle_dataset_") as tmp:
-        tmp_path = Path(tmp)
-        meta = {"title": title, "id": ref, "licenses": [{"name": "CC0-1.0"}]}
-        (tmp_path / "dataset-metadata.json").write_text(json.dumps(meta, indent=2))
+    _log(f"Uploading {n_files} files in {n_shards} shard(s) of ≤{_SHARD_SIZE} each")
 
-        n_files = total_bytes = 0
-        for f in sorted(data_dir.iterdir()):
-            if f.is_file():
+    primary_ref = f"{username}/{slug}"
+    shard_refs: list[str] = []
+
+    for shard_idx in range(n_shards):
+        shard_files = all_files[shard_idx * _SHARD_SIZE : (shard_idx + 1) * _SHARD_SIZE]
+        shard_slug  = slug if shard_idx == 0 else f"{slug}-s{shard_idx}"
+        shard_ref   = f"{username}/{shard_slug}"
+        shard_title = title if shard_idx == 0 else f"{title} (shard {shard_idx})"
+        shard_refs.append(shard_ref)
+
+        _log(f"  Shard {shard_idx}: {len(shard_files)} files → {shard_ref}")
+
+        with tempfile.TemporaryDirectory(prefix="kaggle_dataset_") as tmp:
+            tmp_path = Path(tmp)
+            meta = {"title": shard_title, "id": shard_ref, "licenses": [{"name": "CC0-1.0"}]}
+            (tmp_path / "dataset-metadata.json").write_text(json.dumps(meta, indent=2))
+
+            total_bytes = 0
+            for f in shard_files:
                 shutil.copy2(f, tmp_path / f.name)
-                n_files += 1
                 total_bytes += f.stat().st_size
-        _log(f"  {n_files} files  ({total_bytes:,} bytes)")
+            _log(f"    {len(shard_files)} files  ({total_bytes:,} bytes)")
 
-        result = _kaggle_cmd("datasets", "create", "-p", str(tmp_path))
-        if result.returncode != 0 and "already exists" in (result.stderr + result.stdout).lower():
-            _log("  Already exists — pushing new version…")
-            result = _kaggle_cmd(
-                "datasets", "version", "-p", str(tmp_path), "-m", "Updated by kaggle_bridge.py"
-            )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Dataset upload failed:\n{result.stderr or result.stdout}"
-            )
+            result = _kaggle_cmd("datasets", "create", "-p", str(tmp_path))
+            if result.returncode != 0 and "already exists" in (result.stderr + result.stdout).lower():
+                _log("    Already exists — pushing new version…")
+                result = _kaggle_cmd(
+                    "datasets", "version", "-p", str(tmp_path), "-m", "Updated by kaggle_bridge.py"
+                )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Shard {shard_idx} upload failed:\n{result.stderr or result.stdout}"
+                )
 
-    # Poll until ready.
-    _log("  Waiting for Kaggle to process the dataset…")
-    for _ in range(30):
-        check = _kaggle_cmd("datasets", "files", ref)
-        if check.returncode == 0 and check.stdout.strip():
-            break
-        time.sleep(10)
-    else:
-        _log("  WARNING: dataset may not be ready yet — proceeding anyway.")
+    ref = primary_ref
+    n_files_uploaded = n_files  # used below for the total summary
 
-    _log(f"  Dataset ready → https://www.kaggle.com/datasets/{ref}")
-    return ref
+    # Poll each shard until at least 1 file is visible.
+    _log("  Waiting for Kaggle to process shards…")
+    for shard_ref in shard_refs:
+        for attempt in range(30):  # up to 5 minutes per shard
+            check = _kaggle_cmd("datasets", "files", shard_ref)
+            file_lines = [
+                l.strip() for l in check.stdout.splitlines()
+                if l.strip()
+                and not l.strip().startswith("name")
+                and not l.strip().startswith("---")
+                and not l.strip().startswith("Next Page")
+            ]
+            if check.returncode == 0 and file_lines:
+                _log(f"  {shard_ref}: {len(file_lines)}+ files visible ✓")
+                break
+            _log(f"  {shard_ref}: waiting (attempt {attempt+1}/30)…")
+            time.sleep(10)
+        else:
+            _log(f"  WARNING: {shard_ref} may not be ready — proceeding anyway.")
+
+    _log(f"  All shards ready → https://www.kaggle.com/datasets/{primary_ref}")
+    return primary_ref
 
 
 def upload_embeddings_cache(cache_dir: Path, username: str) -> str:
@@ -271,25 +420,27 @@ print(f"PyTorch {torch.__version__}  CUDA: {torch.cuda.is_available()}")
 print(f"Working dir: {os.getcwd()}")
 """
 
-_CELL_INSTALL_DEPS = """\
-import subprocess, sys, urllib.request
-
-try:
-    urllib.request.urlopen("https://pypi.org", timeout=5)
-except Exception as _e:
-    raise RuntimeError(
-        "No internet access. Verify your phone at https://www.kaggle.com/settings/account"
-    ) from _e
-
-_pkgs = [
-    "transformers>=4.36",
-    "yt-dlp>=2024.1.1",
-    "soundfile>=0.12",
-]
-for _p in _pkgs:
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", _p], check=True)
-print("Extra deps installed:", _pkgs)
-"""
+def _make_install_deps_cell(phase: str = "") -> str:
+    """Return the pip-install cell, adding optuna for the tune phase."""
+    extra = '    "optuna>=3.0",\n' if phase == "tune" else ""
+    return (
+        "import subprocess, sys, urllib.request\n\n"
+        "try:\n"
+        "    urllib.request.urlopen('https://pypi.org', timeout=5)\n"
+        "except Exception as _e:\n"
+        "    raise RuntimeError(\n"
+        "        'No internet access. Verify your phone at https://www.kaggle.com/settings/account'\n"
+        "    ) from _e\n\n"
+        "_pkgs = [\n"
+        '    "transformers>=4.36",\n'
+        '    "yt-dlp>=2024.1.1",\n'
+        '    "soundfile>=0.12",\n'
+        + extra +
+        "]\n"
+        "for _p in _pkgs:\n"
+        "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', _p], check=True)\n"
+        'print("Extra deps installed:", _pkgs)\n'
+    )
 
 
 def _make_install_src_cell(src_tarball: Path) -> str:
@@ -336,26 +487,61 @@ def _make_config_cell(config: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _make_phase1_data_cell(config: dict) -> str:
-    """Phase 1: download SponsorBlock CSV and run data_pipeline.py."""
-    n_videos = config.get("n_videos", 300)
+def _make_phase1_data_cell(config: dict, already_processed: list[str] | None = None,
+                            run_id: str = "") -> str:
+    """Phase 1: download SponsorBlock CSV and run data_pipeline.py.
+
+    Already-processed video IDs are embedded directly in the notebook as a
+    skip-list file, so the kernel never needs to mount a large dataset.
+    The kernel only downloads and processes NEW videos, which are then
+    downloaded back by the bridge and merged into the local master cache.
+    """
+    n_videos = config.get("n_videos", 500)
     skip_audio = config.get("skip_audio", False)
     skip_flag = "--skip-audio" if skip_audio else ""
+
+    # Embed the skip-list as a newline-separated string literal in the cell.
+    if already_processed:
+        ids_literal = "\\n".join(already_processed)
+        skip_ids_block = (
+            "# Write the skip-list of already-processed video IDs.\n"
+            "_SKIP_IDS_PATH = Path('/kaggle/working/skip_ids.txt')\n"
+            f"_SKIP_IDS_PATH.write_text('{ids_literal}')\n"
+            f"print(f'Skipping {len(already_processed)} already-processed videos.')\n\n"
+        )
+        skip_ids_arg = "        '--skip-ids', str(_SKIP_IDS_PATH),\n"
+    else:
+        skip_ids_block = ""
+        skip_ids_arg = ""
+
     return (
-        "import subprocess, sys, urllib.request\n"
+        "import json, subprocess, sys, urllib.request\n"
         "from pathlib import Path\n\n"
-        "# Download SponsorBlock CSV (cached across runs).\n"
-        "_CSV_URL = 'https://sponsor.ajay.app/database/sponsorTimes.csv'\n"
+        + skip_ids_block +
+        "_CSV_MIRRORS = [\n"
+        "    'https://sb.ltn.fi/database/sponsorTimes.csv',\n"
+        "    'https://mirror.sb.mchang.xyz/sponsorTimes.csv',\n"
+        "]\n"
         "_CSV_PATH = Path('/kaggle/working/sponsorTimes.csv')\n"
         "_CACHE_DIR = Path('/kaggle/working/embeddings_cache')\n"
         "_CACHE_DIR.mkdir(parents=True, exist_ok=True)\n\n"
         "if not _CSV_PATH.exists():\n"
         "    print('Downloading SponsorBlock CSV (~2-4 GB)…')\n"
-        "    urllib.request.urlretrieve(_CSV_URL, _CSV_PATH)\n"
-        "    print(f'Downloaded: {_CSV_PATH.stat().st_size:,} bytes')\n"
+        "    _downloaded = False\n"
+        "    for _url in _CSV_MIRRORS:\n"
+        "        try:\n"
+        "            print(f'  Trying {_url}')\n"
+        "            urllib.request.urlretrieve(_url, _CSV_PATH)\n"
+        "            print(f'  Downloaded: {_CSV_PATH.stat().st_size:,} bytes')\n"
+        "            _downloaded = True\n"
+        "            break\n"
+        "        except Exception as _e:\n"
+        "            print(f'  Failed: {_e}')\n"
+        "    if not _downloaded:\n"
+        "        raise RuntimeError('All SponsorBlock mirrors failed — check mirror availability.')\n"
         "else:\n"
         "    print(f'CSV already present: {_CSV_PATH.stat().st_size:,} bytes')\n\n"
-        "# Run data pipeline.\n"
+        "# Run data pipeline — only processes videos not in the skip list.\n"
         "result = subprocess.run(\n"
         "    [\n"
         "        sys.executable, '/tmp/yt_sponsor_src/src/data_pipeline.py',\n"
@@ -363,12 +549,23 @@ def _make_phase1_data_cell(config: dict) -> str:
         "        '--out', str(_CACHE_DIR),\n"
         f"       '--videos', '{n_videos}',\n"
         "        '--device', 'cuda' if __import__('torch').cuda.is_available() else 'cpu',\n"
+        + skip_ids_arg
         + (f"        '{skip_flag}',\n" if skip_flag else "") +
         "    ],\n"
         "    check=True,\n"
         ")\n"
-        "_cached = list(_CACHE_DIR.glob('*.npz'))\n"
-        "print(f'Cache: {len(_cached)} videos')\n"
+        "_new_files = list(_CACHE_DIR.glob('*.npz'))\n"
+        "print(f'New videos this batch: {len(_new_files)}')\n\n"
+        "# Write a tiny summary JSON so the bridge can verify these outputs are fresh.\n"
+        "_OUT_DIR = Path('/kaggle/working/outputs')\n"
+        "_OUT_DIR.mkdir(parents=True, exist_ok=True)\n"
+        "(_OUT_DIR / 'phase1_summary.json').write_text(json.dumps({\n"
+        f"    'run_id': '{run_id}',\n"
+        "    'new_videos_this_batch': len(_new_files),\n"
+        "    'new_video_ids': [_f.stem for _f in _new_files],\n"
+        "}))\n"
+        f"print('run_id={run_id}')\n"
+        "print('Summary written to outputs/phase1_summary.json')\n"
     )
 
 
@@ -381,6 +578,18 @@ def _make_phase_train_cell(config: dict) -> str:
         "    check=True,\n"
         ")\n"
         "print('train.py completed with exit code', result.returncode)\n"
+    )
+
+
+def _make_phase_tune_cell(config: dict) -> str:
+    """Phase tune: run tune.py (Optuna hyperparameter search)."""
+    return (
+        "import subprocess, sys\n"
+        "result = subprocess.run(\n"
+        "    [sys.executable, '/tmp/yt_sponsor_src/src/tune.py', '--config', '/tmp/run_config.json'],\n"
+        "    check=True,\n"
+        ")\n"
+        "print('tune.py completed with exit code', result.returncode)\n"
     )
 
 
@@ -410,6 +619,25 @@ def _make_phase5_export_cell(config: dict) -> str:
     )
 
 
+def _make_run_manifest_cell(run_id: str, phase: str) -> str:
+    """Last notebook cell: stamp run_manifest.json so the bridge can verify freshness.
+
+    Written as the FINAL cell so it only executes when all prior cells succeed.
+    If the kernel errors out before reaching this cell, run_manifest.json will be
+    absent from the downloaded outputs, which the bridge treats as a stale-output
+    signal and raises RuntimeError rather than silently returning stale results.
+    """
+    return (
+        "import json\n"
+        "from pathlib import Path\n\n"
+        "_OUT = Path('/kaggle/working/outputs')\n"
+        "_OUT.mkdir(exist_ok=True)\n"
+        f"_manifest = {{'run_id': '{run_id}', 'phase': '{phase}'}}\n"
+        "(_OUT / 'run_manifest.json').write_text(json.dumps(_manifest, indent=2))\n"
+        f"print(f'run_manifest written: run_id={run_id}  phase={phase}')\n"
+    )
+
+
 _CELL_COLLECT_OUTPUTS = """\
 # Stage all outputs under /kaggle/working/outputs/ for download.
 import shutil
@@ -434,30 +662,148 @@ print(f'\\nAll outputs in {_OUT}')
 """
 
 
+def _make_phase1_upload_cell(username: str) -> str:
+    """Upload the embeddings cache to a Kaggle Dataset from inside the kernel.
+
+    The username is embedded at notebook-generation time so the kernel doesn't
+    need to resolve it (access_token format has no username field).
+    """
+    slug = _EMBEDDINGS_DATASET_SLUG
+    return (
+        "import json, os, subprocess, sys\n"
+        "from pathlib import Path\n\n"
+        "_CACHE_DIR = Path('/kaggle/working/embeddings_cache')\n"
+        "_UPLOAD_DIR = Path('/kaggle/working/dataset_upload')\n"
+        "_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)\n\n"
+        "# Copy .npz files to a clean upload staging dir.\n"
+        "import shutil as _shutil\n"
+        "_npz = sorted(_CACHE_DIR.glob('*.npz'))\n"
+        "print(f'Staging {len(_npz)} .npz files for dataset upload…')\n"
+        "for _f in _npz:\n"
+        "    _shutil.copy2(_f, _UPLOAD_DIR / _f.name)\n\n"
+        "# Username is embedded at notebook-generation time.\n"
+        f"_username = '{username}'\n"
+        f"_dataset_id = '{username}/{slug}'\n"
+        "# Write dataset-metadata.json.\n"
+        f"_meta = {{'title': 'YT Sponsor Embeddings Cache', 'id': _dataset_id, 'licenses': [{{'name': 'CC0-1.0'}}]}}\n"
+        "(_UPLOAD_DIR / 'dataset-metadata.json').write_text(__import__('json').dumps(_meta, indent=2))\n\n"
+        "# Try to create; if already exists, push a new version.\n"
+        "_r = subprocess.run(\n"
+        "    ['kaggle', 'datasets', 'create', '-p', str(_UPLOAD_DIR)],\n"
+        "    capture_output=True, text=True,\n"
+        ")\n"
+        "if _r.returncode != 0 and 'already exists' in (_r.stderr + _r.stdout).lower():\n"
+        "    print('Dataset exists — pushing new version…')\n"
+        "    _r = subprocess.run(\n"
+        "        ['kaggle', 'datasets', 'version', '-p', str(_UPLOAD_DIR),\n"
+        "         '-m', f'Batch update: {len(_npz)} videos'],\n"
+        "        capture_output=True, text=True,\n"
+        "    )\n"
+        "if _r.returncode != 0:\n"
+        "    print('Dataset upload stderr:', _r.stderr)\n"
+        "    print('Dataset upload stdout:', _r.stdout)\n"
+        "    raise RuntimeError('kaggle dataset push failed — see output above.')\n"
+        "print(f'Dataset uploaded: {_dataset_id}  ({len(_npz)} videos)')\n"
+        "# Write a summary log for the bridge to download.\n"
+        "_summary = {\n"
+        "    'total_cached': len(_npz),\n"
+        f"    'dataset': f'{{_username}}/{slug}',\n"
+        "    'uploaded_from_kernel': True,\n"
+        "}\n"
+        "Path('/kaggle/working/outputs').mkdir(exist_ok=True)\n"
+        "Path('/kaggle/working/outputs/phase1_summary.json').write_text(\n"
+        "    __import__('json').dumps(_summary, indent=2)\n"
+        ")\n"
+        "print('Summary:', _summary)\n"
+    )
+
+
+# Phase 1: delete only the large SponsorBlock CSV before download.
+# The new .npz files stay in /kaggle/working/embeddings_cache/ so the bridge
+# can download them and merge them into the local master cache.
+_CELL_COLLECT_OUTPUTS_PHASE1 = """\
+import shutil
+from pathlib import Path
+
+# Delete only the large SponsorBlock CSV — the new .npz files will be
+# downloaded by the bridge and merged into the local master cache.
+_csv = Path('/kaggle/working/sponsorTimes.csv')
+if _csv.exists():
+    _csv.unlink()
+    print(f'Removed {_csv.name}')
+
+# Report what will be downloaded.
+_CACHE_DIR = Path('/kaggle/working/embeddings_cache')
+_npz = sorted(_CACHE_DIR.glob('*.npz')) if _CACHE_DIR.is_dir() else []
+_total_bytes = sum(_f.stat().st_size for _f in _npz)
+print(f'New .npz files to download: {len(_npz)}  ({_total_bytes / 1e6:.1f} MB total)')
+
+_OUT = Path('/kaggle/working/outputs')
+_OUT.mkdir(exist_ok=True)
+for _f in _OUT.glob('phase1_summary.json'):
+    print(f'  summary: {_f.name}  ({_f.stat().st_size:,} bytes)')
+print(f'\\nReady for download.')
+"""
+
+
 # ---------------------------------------------------------------------------
 # Dataset mount cell (copy from /kaggle/input/<slug>/ into working dir)
 # ---------------------------------------------------------------------------
 
 
 def _make_mount_dataset_cell(slug: str, dest_dir: str) -> str:
-    """Copy mounted Kaggle Dataset files into the kernel working directory."""
+    """Copy mounted Kaggle Dataset files into the kernel working directory.
+
+    Kaggle mounts datasets at /kaggle/input/<slug>/ in classic kernels but
+    sometimes uses /kaggle/input/datasets/ or other paths in newer API versions.
+    We search the entire /kaggle/input tree for the expected file extension so
+    the cell works regardless of Kaggle's mount layout.
+    """
+    # Infer file extension from slug so we grab the right files.
+    # Embeddings cache → .npz; teacher checkpoint → .pt
+    if "embeddings" in slug:
+        ext = ".npz"
+    else:
+        ext = ".pt"
+
     return (
-        "import shutil\n"
+        "import shutil, zipfile\n"
         "from pathlib import Path\n\n"
-        f"_DATASET_INPUT = Path('/kaggle/input/{slug}')\n"
+        f"_SLUG = '{slug}'\n"
+        f"_EXT  = '{ext}'\n"
         f"_DEST = Path('{dest_dir}')\n"
         "_DEST.mkdir(parents=True, exist_ok=True)\n\n"
-        "if not _DATASET_INPUT.exists():\n"
-        "    raise RuntimeError(\n"
-        f"        f'Dataset not mounted: {{_DATASET_INPUT}}. '\n"
-        "        'Check dataset_sources in kernel-metadata.json.'\n"
-        "    )\n\n"
-        "for _f in _DATASET_INPUT.iterdir():\n"
-        "    if _f.is_file() and not (_DEST / _f.name).exists():\n"
-        "        shutil.copy2(_f, _DEST / _f.name)\n"
-        "        print(f'  copied: {_f.name}')\n\n"
-        "_files = list(_DEST.iterdir())\n"
-        "print(f'Dataset ready: {len(_files)} files in {_DEST}')\n"
+        "# --- locate data.zip anywhere under /kaggle/input ---\n"
+        "_kaggle_input = Path('/kaggle/input')\n"
+        "print(f'Scanning /kaggle/input for data.zip…')\n"
+        "_zip_files = sorted(_kaggle_input.rglob('data.zip'))\n"
+        "if _zip_files:\n"
+        "    print(f'Found zip: {_zip_files[0]}  ({_zip_files[0].stat().st_size:,} bytes)')\n"
+        "    with zipfile.ZipFile(_zip_files[0]) as _zf:\n"
+        "        _members = [m for m in _zf.namelist() if m.endswith(_EXT)]\n"
+        "        print(f'Extracting {len(_members)} {_EXT} files…')\n"
+        "        for _m in _members:\n"
+        "            _dst = _DEST / Path(_m).name\n"
+        "            if not _dst.exists():\n"
+        "                with _zf.open(_m) as _src, open(_dst, 'wb') as _out:\n"
+        "                    _out.write(_src.read())\n"
+        "else:\n"
+        "    # Fallback: look for loose files (old-style dataset without zip).\n"
+        "    print('No data.zip found — falling back to loose file scan')\n"
+        "    _src_files = sorted(_kaggle_input.rglob(f'*{_EXT}'))\n"
+        "    if not _src_files:\n"
+        "        _available = sorted(str(p) for p in _kaggle_input.iterdir()) if _kaggle_input.exists() else []\n"
+        "        raise RuntimeError(\n"
+        f"            f'No {{_EXT}} files or data.zip found under /kaggle/input. '\n"
+        "            f'Available: {_available}. Slug: {_SLUG}'\n"
+        "        )\n"
+        "    print(f'Found {len(_src_files)} loose files')\n"
+        "    for _f in _src_files:\n"
+        "        _dst = _DEST / _f.name\n"
+        "        if not _dst.exists():\n"
+        "            shutil.copy2(_f, _dst)\n\n"
+        "_files = list(_DEST.glob(f'*{_EXT}'))\n"
+        "print(f'Dataset ready: {len(_files)} {_EXT} files in {_DEST}')\n"
     )
 
 
@@ -471,14 +817,23 @@ def build_notebook(
     src_tarball: Path,
     phase: str,
     dataset_sources_slugs: list[str] | None = None,
+    already_processed: list[str] | None = None,
+    run_id: str = "",
+    username: str = "",
 ) -> nbformat.NotebookNode:
     """Assemble the Kaggle training notebook for the given phase.
 
     Args:
         config:                 Phase config dict (will be embedded in the notebook).
         src_tarball:            Path to the bundled training/src/ tarball.
-        phase:                  Phase name: "data" | "baseline" | "teacher" | "distill" | "export".
+        phase:                  Phase name: "data" | "baseline" | "teacher" | "tune" |
+                                "distill" | "export".
         dataset_sources_slugs:  List of Kaggle Dataset slugs mounted in the kernel.
+        already_processed:      Phase 1 only. Video IDs already in the local master cache.
+                                Embedded in the notebook as a skip-list so the kernel only
+                                processes NEW videos.
+        run_id:                 Unique ID stamped into run_manifest.json so the bridge
+                                can detect stale (cached) outputs from a previous run.
 
     Returns:
         A nbformat.NotebookNode ready to be written to disk.
@@ -486,11 +841,11 @@ def build_notebook(
     nb = new_notebook()
     cells = [
         new_code_cell(_CELL_SETUP),
-        new_code_cell(_CELL_INSTALL_DEPS),
+        new_code_cell(_make_install_deps_cell(phase)),  # adds optuna for tune phase
         new_code_cell(_make_install_src_cell(src_tarball)),
     ]
 
-    # Mount datasets if needed.
+    # Mount datasets if needed (phases 2-5 only — phase 1 uses embedded skip-list).
     if dataset_sources_slugs:
         for slug in dataset_sources_slugs:
             if slug == _EMBEDDINGS_DATASET_SLUG:
@@ -506,15 +861,26 @@ def build_notebook(
     cells.append(new_code_cell(_make_config_cell(config)))
 
     if phase == "data":
-        cells.append(new_code_cell(_make_phase1_data_cell(config)))
+        # Embed the already-processed IDs so the kernel skips them.
+        # New .npz files are left in /kaggle/working/embeddings_cache/ for download.
+        cells.append(new_code_cell(_make_phase1_data_cell(config, already_processed=already_processed, run_id=run_id)))
+        cells.append(new_code_cell(_CELL_COLLECT_OUTPUTS_PHASE1))
+        # Phase 1 uses _wait_phase1_fresh for staleness detection (run_id in phase1_summary.json).
+        # No separate run_manifest needed.
     elif phase in ("baseline", "teacher", "distill"):
         cells.append(new_code_cell(_make_phase_train_cell(config)))
+        cells.append(new_code_cell(_CELL_COLLECT_OUTPUTS))
+        cells.append(new_code_cell(_make_run_manifest_cell(run_id, phase)))
+    elif phase == "tune":
+        cells.append(new_code_cell(_make_phase_tune_cell(config)))
+        cells.append(new_code_cell(_CELL_COLLECT_OUTPUTS))
+        cells.append(new_code_cell(_make_run_manifest_cell(run_id, phase)))
     elif phase == "export":
         cells.append(new_code_cell(_make_phase5_export_cell(config)))
+        cells.append(new_code_cell(_CELL_COLLECT_OUTPUTS))
+        cells.append(new_code_cell(_make_run_manifest_cell(run_id, phase)))
     else:
         raise ValueError(f"Unknown phase: {phase!r}")
-
-    cells.append(new_code_cell(_CELL_COLLECT_OUTPUTS))
 
     nb.cells = cells
     nb.metadata["kernelspec"] = {
@@ -559,18 +925,44 @@ def _write_kernel_metadata(
 def push_kernel(folder: Path) -> str:
     _log("Pushing kernel to Kaggle…")
     result = _kaggle_cmd("kernels", "push", "-p", str(folder))
+    push_out = (result.stdout + result.stderr).strip()
     if result.returncode != 0:
         raise RuntimeError(
-            f"kaggle kernels push failed (exit {result.returncode}):\n"
-            f"{result.stderr or result.stdout}"
+            f"kaggle kernels push failed (exit {result.returncode}):\n{push_out}"
         )
+    _log(f"  push output: {push_out}")
+    # Kaggle returns exit 0 even for quota errors — detect them explicitly.
+    if "quota" in push_out.lower() or "push error" in push_out.lower():
+        raise RuntimeError(f"Kaggle kernel push rejected: {push_out}")
     meta = json.loads((folder / "kernel-metadata.json").read_text())
     ref = meta["id"]
     _log(f"Pushed → https://www.kaggle.com/code/{ref}")
     return ref
 
 
+def _kaggle_api_get(path: str) -> dict | None:
+    """GET request to the Kaggle REST API using credentials from env vars."""
+    import urllib.request as _req, base64 as _b64
+    username = os.environ.get("KAGGLE_USERNAME", "")
+    key = os.environ.get("KAGGLE_KEY", "")
+    if not (username and key):
+        return None
+    auth = _b64.b64encode(f"{username}:{key}".encode()).decode()
+    url = f"https://www.kaggle.com/api/v1{path}"
+    try:
+        req = _req.Request(
+            url,
+            headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
+        )
+        with _req.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        _log(f"  (API call failed for {path}: {exc})")
+        return None
+
+
 def wait_for_completion(kernel_ref: str) -> str:
+    """Poll kernel status until it reaches a terminal state."""
     _log(f"Polling every {POLL_INTERVAL_SEC}s (timeout {MAX_WAIT_SEC}s)…")
     elapsed = 0
     _TERMINAL = {"complete": "complete", "error": "error", "cancelacknowledged": "cancelAcknowledged"}
@@ -585,6 +977,113 @@ def wait_for_completion(kernel_ref: str) -> str:
         time.sleep(POLL_INTERVAL_SEC)
         elapsed += POLL_INTERVAL_SEC
     return "timeout"
+
+
+def _wait_phase1_fresh(kernel_ref: str, run_id: str, slug: str) -> tuple[list[Path], Path]:
+    """Wait until phase-1 kernel outputs contain our run_id, then return them.
+
+    Kaggle's ``kaggle kernels status`` and ``kaggle kernels output`` both return
+    the PREVIOUS run's result while the newly-pushed version is still queued.
+    We detect freshness by checking ``run_id`` in ``phase1_summary.json``.
+
+    Returns ``(files, output_dir)`` once the fresh outputs are confirmed.
+    """
+    _log(f"Waiting for fresh phase-1 outputs (run_id={run_id})…")
+
+    # Probe the Kaggle REST API to see what version is registered.
+    kernel_info = _kaggle_api_get(f"/kernels/{kernel_ref}")
+    if kernel_info:
+        cur_ver = kernel_info.get("currentRunningVersion") or kernel_info.get("currentVersion")
+        _log(f"  Kaggle API — kernel info: currentRunningVersion={cur_ver}  "
+             f"keys={list(kernel_info.keys())[:10]}")
+    else:
+        _log("  (Kaggle REST API lookup failed — proceeding with CLI polling)")
+
+    elapsed = 0
+    attempt = 0
+
+    while elapsed < MAX_WAIT_SEC:
+        result = _kaggle_cmd("kernels", "status", kernel_ref)
+        raw = (result.stdout + result.stderr).strip()
+        lower = raw.lower()
+
+        if "error" in lower and "complete" not in lower:
+            raise RuntimeError(
+                f"Kernel errored. Inspect at: https://www.kaggle.com/code/{kernel_ref}"
+            )
+
+        status = (
+            "complete" if "complete" in lower
+            else "running" if "running" in lower
+            else "queued" if "queued" in lower
+            else "pending"
+        )
+        _log(f"  status={status}  elapsed={elapsed}s  raw={raw!r}")
+
+        # Try to download and verify outputs whenever something might have finished.
+        if status in ("complete", "running", "queued"):
+            attempt += 1
+            ts = datetime.now().strftime("%H%M%S")
+            out_dir = _TRAINING_ROOT / "kaggle_outputs" / f"{slug}_{run_id}_{attempt:02d}"
+            try:
+                files = fetch_outputs(kernel_ref, out_dir)
+                for f in files:
+                    if f.name == "phase1_summary.json":
+                        try:
+                            summary = json.loads(f.read_text())
+                            if summary.get("run_id") == run_id:
+                                _log(f"  Fresh outputs confirmed ✓  (attempt {attempt})")
+                                return files, out_dir
+                            else:
+                                _log(
+                                    f"  Stale output from a previous run "
+                                    f"(expected run_id={run_id!r}, got {summary.get('run_id')!r})"
+                                    " — still waiting…"
+                                )
+                        except Exception:
+                            pass
+                        break
+            except RuntimeError as exc:
+                _log(f"  Output download attempt {attempt} failed: {exc}")
+
+        time.sleep(POLL_INTERVAL_SEC)
+        elapsed += POLL_INTERVAL_SEC
+
+    raise RuntimeError(
+        f"Timed out ({MAX_WAIT_SEC}s) waiting for fresh phase-1 outputs. "
+        f"Check https://www.kaggle.com/code/{kernel_ref}"
+    )
+
+
+def _verify_fresh_outputs(files: list[Path], run_id: str) -> bool:
+    """Return True if downloaded outputs contain a run_manifest.json with matching run_id.
+
+    The run_manifest.json is written as the LAST notebook cell, so it is absent
+    whenever the kernel fails before reaching that point.  If it's missing or
+    contains a different run_id, the outputs are stale (from a previous run) and
+    should not be used.
+    """
+    for f in files:
+        if f.name == "run_manifest.json":
+            try:
+                manifest = json.loads(f.read_text())
+                got_id = manifest.get("run_id", "")
+                if got_id == run_id:
+                    _log(f"  run_manifest verified ✓ (run_id={run_id})")
+                    return True
+                _log(
+                    f"  Stale output detected — expected run_id={run_id!r}, "
+                    f"got {got_id!r}.  The kernel likely failed before completing."
+                )
+                return False
+            except Exception as exc:
+                _log(f"  WARNING: could not parse run_manifest.json: {exc}")
+                return False
+    _log(
+        f"  run_manifest.json not found in downloaded outputs "
+        f"(expected run_id={run_id!r}).  Kernel may have errored mid-run."
+    )
+    return False
 
 
 def fetch_outputs(kernel_ref: str, output_dir: Path) -> list[Path]:
@@ -612,12 +1111,18 @@ def route_outputs(files: list[Path], output_dir: Path, no_overwrite: bool = Fals
     *.pt    → model checkpoints
     *.onnx  → ONNX model (also copy to youtube-ml-sponsor-detector/ for the extension)
     *.json  → training logs
+    *.npz   → embedding cache files (phase 1)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     extension_dir = _PROJECT_ROOT / "youtube-ml-sponsor-detector"
 
     for f in files:
-        dest = output_dir / f.name
+        # Preserve embeddings_cache/ subdirectory structure for .npz files.
+        if f.suffix == ".npz" and f.parent.name == "embeddings_cache":
+            dest = output_dir / "embeddings_cache" / f.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            dest = output_dir / f.name
         if no_overwrite and dest.exists():
             _log(f"  (skip — exists) {f.name}")
             continue
@@ -647,28 +1152,45 @@ def _make_kernel_slug(config: dict, config_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _get_dataset_sources(phase: str, username: str) -> list[str]:
-    """Return the list of Kaggle Dataset references to mount for each phase."""
-    emb_ref = f"{username}/{_EMBEDDINGS_DATASET_SLUG}"
+def _embeddings_shard_slugs(n_total: int) -> list[str]:
+    """Return all shard slugs for the embeddings dataset given total file count."""
+    n_shards = max(1, (n_total + _SHARD_SIZE - 1) // _SHARD_SIZE)
+    slugs = [_EMBEDDINGS_DATASET_SLUG]
+    for i in range(1, n_shards):
+        slugs.append(f"{_EMBEDDINGS_DATASET_SLUG}-s{i}")
+    return slugs
+
+
+def _get_dataset_sources(phase: str, username: str, n_embeddings: int = 0) -> list[str]:
+    """Return the list of Kaggle Dataset references to mount for each phase.
+
+    Phase 1 ("data") never mounts anything — already-processed IDs are embedded
+    directly in the notebook as a skip-list, so no dataset mount is needed.
+    """
+    emb_slugs   = _embeddings_shard_slugs(n_embeddings)
+    emb_refs    = [f"{username}/{s}" for s in emb_slugs]
     teacher_ref = f"{username}/{_TEACHER_CKPT_DATASET_SLUG}"
 
     return {
-        "data": [],                          # phase 1 builds the cache; nothing to mount
-        "baseline": [emb_ref],               # phase 2 reads embeddings
-        "teacher": [emb_ref],                # phase 3 reads embeddings
-        "distill": [emb_ref, teacher_ref],   # phase 4 reads embeddings + teacher ckpt
-        "export": [teacher_ref],             # phase 5 reads student ckpt (same dataset as teacher_ref after phase 4 updates it)
+        "data":     [],
+        "baseline": emb_refs,
+        "teacher":  emb_refs,
+        "tune":     emb_refs,
+        "distill":  emb_refs + [teacher_ref],
+        "export":   [teacher_ref],
     }.get(phase, [])
 
 
-def _get_dataset_slugs(phase: str) -> list[str]:
-    """Return only the slug part (for notebook mount cells)."""
+def _get_dataset_slugs(phase: str, n_embeddings: int = 0) -> list[str]:
+    """Return only the slug parts (for notebook mount cells)."""
+    emb_slugs = _embeddings_shard_slugs(n_embeddings)
     return {
-        "data": [],
-        "baseline": [_EMBEDDINGS_DATASET_SLUG],
-        "teacher": [_EMBEDDINGS_DATASET_SLUG],
-        "distill": [_EMBEDDINGS_DATASET_SLUG, _TEACHER_CKPT_DATASET_SLUG],
-        "export": [_TEACHER_CKPT_DATASET_SLUG],
+        "data":     [],
+        "baseline": emb_slugs,
+        "teacher":  emb_slugs,
+        "tune":     emb_slugs,
+        "distill":  emb_slugs + [_TEACHER_CKPT_DATASET_SLUG],
+        "export":   [_TEACHER_CKPT_DATASET_SLUG],
     }.get(phase, [])
 
 
@@ -718,8 +1240,10 @@ def dry_run(config_path: Path, enable_gpu: bool, kernel_slug: str | None = None)
     nb_name = f"{slug}.ipynb"
     nb_path = out_dir / nb_name
     dataset_slugs = _get_dataset_slugs(phase)
+    dry_run_id = "dryrun_00000000_000000"
     try:
-        nb = build_notebook(config, tar_path, phase=phase, dataset_sources_slugs=dataset_slugs)
+        nb = build_notebook(config, tar_path, phase=phase, dataset_sources_slugs=dataset_slugs,
+                            run_id=dry_run_id, username=username)
         nbformat.write(nb, nb_path)
         results.append(("notebook", True, f"{nb_name}  ({len(nb.cells)} cells)"))
     except Exception as exc:
@@ -795,6 +1319,7 @@ def run_bridge(
     no_overwrite: bool = False,
     upload_cache: bool = False,
     upload_teacher_ckpt: bool = False,
+    accumulate: bool = False,
 ) -> bool:
     """Execute the full bridge round-trip for one phase config.
 
@@ -803,10 +1328,14 @@ def run_bridge(
         enable_gpu:           Whether to request a Kaggle GPU.
         kernel_slug:          Override kernel slug.
         no_overwrite:         Skip overwriting existing local outputs.
-        upload_cache:         After phase 1 completes, upload the embedding cache
-                              as a Kaggle Dataset so subsequent phases can mount it.
+        upload_cache:         After phase 1 completes, upload the full master
+                              embedding cache as a Kaggle Dataset so phases 2–5
+                              can mount it.
         upload_teacher_ckpt:  After phase 3 completes, upload teacher_best.pt
                               as a Kaggle Dataset for phase 4 to consume.
+        accumulate:           Phase 1 only: embed already-processed video IDs as a
+                              skip-list so the kernel only processes NEW videos.
+                              Use this on every run after the first.
     """
     config = json.loads(config_path.read_text())
     phase = config.get("phase", "teacher")
@@ -820,8 +1349,30 @@ def run_bridge(
     authenticate()
     username = _kaggle_username()
 
-    dataset_sources = _get_dataset_sources(phase, username)
-    dataset_slugs = _get_dataset_slugs(phase)
+    # Generate a unique run_id for ALL phases.  It is embedded in the notebook
+    # and written to run_manifest.json as the last cell.  The bridge checks this
+    # after downloading outputs to detect stale results from a previous run.
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _log(f"run_id={run_id}")
+
+    # For phase 1, derive the already-processed video IDs from the master cache.
+    already_processed: list[str] | None = None
+    if phase == "data":
+        master_ids = sorted(
+            f.stem for f in _MASTER_CACHE_DIR.glob("*.npz")
+        ) if _MASTER_CACHE_DIR.is_dir() else []
+        if master_ids:
+            already_processed = master_ids
+            _log(f"Master cache: {len(master_ids)} videos already processed (will be skipped).")
+        else:
+            _log("Master cache is empty — processing fresh batch.")
+        _print_cache_total(label="Before this batch")
+
+    n_embeddings = sum(1 for _ in _MASTER_CACHE_DIR.glob("*.npz")) if _MASTER_CACHE_DIR.is_dir() else 0
+    dataset_sources = _get_dataset_sources(phase, username, n_embeddings)
+    dataset_slugs = _get_dataset_slugs(phase, n_embeddings)
+    if dataset_slugs:
+        _log(f"Dataset shards: {dataset_slugs}")
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="yt_sponsor_kaggle_"))
     try:
@@ -830,7 +1381,13 @@ def run_bridge(
         _bundle_source(tar_path)
 
         # 2. Build notebook.
-        nb = build_notebook(config, tar_path, phase=phase, dataset_sources_slugs=dataset_slugs)
+        nb = build_notebook(
+            config, tar_path, phase=phase,
+            dataset_sources_slugs=dataset_slugs,
+            already_processed=already_processed,
+            run_id=run_id,
+            username=username,
+        )
         nb_name = f"{slug}.ipynb"
         nb_path = tmp_dir / nb_name
         nbformat.write(nb, nb_path)
@@ -847,35 +1404,68 @@ def run_bridge(
         )
 
         # 4. Push kernel.
+        meta_path = tmp_dir / "kernel-metadata.json"
+        _log(f"kernel-metadata.json:\n{meta_path.read_text()}")
         kernel_ref = push_kernel(tmp_dir)
 
-        # 5. Wait.
-        final_status = wait_for_completion(kernel_ref)
-        _log(f"Kernel finished: {final_status}")
-
-        if final_status != "complete":
-            _log(f"Kernel did not complete — inspect at: https://www.kaggle.com/code/{kernel_ref}")
-            return False
-
-        # 6. Fetch outputs.
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        raw_output_dir = _TRAINING_ROOT / "kaggle_outputs" / f"{slug}_{timestamp}"
-        files = fetch_outputs(kernel_ref, raw_output_dir)
-
-        # 7. Route to training/outputs/<phase>/.
+        # 5. Wait for completion and fetch outputs.
         local_output_dir = _TRAINING_ROOT / "outputs" / phase
+        if phase == "data":
+            # Phase 1: use run_id to verify we got fresh (not cached) outputs.
+            files, raw_output_dir = _wait_phase1_fresh(kernel_ref, run_id, slug)
+        else:
+            # Phases 2-5: poll until complete, then download and verify freshness.
+            final_status = wait_for_completion(kernel_ref)
+            _log(f"Kernel finished: {final_status}")
+            if final_status != "complete":
+                _log(f"Kernel did not complete — inspect at: https://www.kaggle.com/code/{kernel_ref}")
+                return False
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            raw_output_dir = _TRAINING_ROOT / "kaggle_outputs" / f"{slug}_{timestamp}"
+            files = fetch_outputs(kernel_ref, raw_output_dir)
+            # Verify that we got fresh outputs for THIS run (not a cached previous run).
+            # run_manifest.json is written as the final notebook cell; its absence or a
+            # mismatched run_id means the kernel failed before completing.
+            if not _verify_fresh_outputs(files, run_id):
+                raise RuntimeError(
+                    f"Downloaded outputs are stale (run_id mismatch or missing run_manifest.json). "
+                    f"The kernel at https://www.kaggle.com/code/{kernel_ref} likely failed "
+                    f"mid-run — Kaggle returned the previous run's output files. "
+                    f"Check the kernel logs before re-running."
+                )
+
+        # 6. Route to training/outputs/<phase>/.
         route_outputs(files, local_output_dir, no_overwrite=no_overwrite)
 
-        # 8. Phase-specific post-processing: upload artifacts for next phase.
-        if upload_cache and phase == "data":
-            cache_dir = local_output_dir / "embeddings_cache"
-            if not cache_dir.is_dir():
-                # Kaggle output was flat — use raw_output_dir.
-                cache_dir = raw_output_dir
-            if any(cache_dir.glob("*.npz")):
-                upload_embeddings_cache(cache_dir, username)
+        # 8. Phase-specific post-processing.
+        if phase == "data":
+            # Merge any newly downloaded .npz files into the persistent master cache.
+            new_count = 0
+            for src in [raw_output_dir / "embeddings_cache", raw_output_dir]:
+                if src.is_dir() and any(src.glob("*.npz")):
+                    new_count = _merge_into_master_cache(src)
+                    break
+
+            # Read summary JSON written by data_pipeline inside the kernel.
+            summary_path = local_output_dir / "phase1_summary.json"
+            batch_new = None
+            if summary_path.exists():
+                summary = json.loads(summary_path.read_text())
+                batch_new = summary.get("new_videos_this_batch")
+                _log(f"Kernel reported {batch_new} new videos this batch.")
             else:
-                _log("WARNING: no .npz files found in output — skipping cache upload.")
+                _log("WARNING: phase1_summary.json not found.")
+
+            master_total = sum(1 for _ in _MASTER_CACHE_DIR.glob("*.npz")) if _MASTER_CACHE_DIR.is_dir() else 0
+            _print_cache_total(label="Running total")
+
+            # Optionally upload the full master cache to Kaggle for phases 2-5.
+            if upload_cache:
+                if master_total > 0:
+                    _log(f"Uploading full master cache ({master_total} videos) to Kaggle Dataset…")
+                    upload_embeddings_cache(_MASTER_CACHE_DIR, username)
+                else:
+                    _log("WARNING: master cache is empty — skipping Kaggle upload.")
 
         if upload_teacher_ckpt and phase == "teacher":
             ckpt_dir = local_output_dir
@@ -945,12 +1535,78 @@ def main() -> None:
             "as a Kaggle Dataset so phase 4 can load it for distillation."
         ),
     )
+    p.add_argument(
+        "--accumulate", action="store_true", default=False,
+        help=(
+            "Phase 1 only: mount the existing embeddings cache dataset and seed the "
+            "working cache from it before running data_pipeline.py.  New videos are "
+            "added; already-processed ones are skipped.  Use together with "
+            "--upload-cache to push the combined result back.  Not needed on the "
+            "first run (when no dataset exists yet)."
+        ),
+    )
+    p.add_argument(
+        "--upload-cache-only", action="store_true", default=False,
+        help=(
+            "Skip the Kaggle kernel entirely and just upload the existing .npz cache "
+            "to Kaggle Datasets.  Searches training/outputs/data/embeddings_cache/, "
+            "training/outputs/data/, and training/kaggle_outputs/ for .npz files.  "
+            "Use --cache-dir to point at a specific directory instead."
+        ),
+    )
+    p.add_argument(
+        "--cache-dir", type=Path, default=None,
+        help=(
+            "Explicit path to a directory of .npz files to upload with "
+            "--upload-cache-only.  Overrides the automatic search."
+        ),
+    )
     args = p.parse_args()
 
     config_path = Path(args.config)
     if not config_path.exists():
         print(f"Config not found: {config_path}")
         sys.exit(1)
+
+    if args.upload_cache_only:
+        username = _kaggle_username()
+
+        # Explicit dir takes priority.
+        if args.cache_dir is not None:
+            cache_dir = args.cache_dir.expanduser().resolve()
+            if not cache_dir.is_dir():
+                print(f"ERROR: --cache-dir does not exist: {cache_dir}")
+                sys.exit(1)
+        else:
+            # Auto-search: pick the directory with the MOST .npz files.
+            candidates = [
+                _MASTER_CACHE_DIR,  # persistent master cache — always the best source
+                _TRAINING_ROOT / "outputs" / "data" / "embeddings_cache",
+                _TRAINING_ROOT / "outputs" / "data",
+            ]
+            kaggle_out = _TRAINING_ROOT / "kaggle_outputs"
+            if kaggle_out.is_dir():
+                for d in sorted(kaggle_out.iterdir(), reverse=True):
+                    candidates.append(d / "embeddings_cache")
+                    candidates.append(d)
+            best, best_count = None, 0
+            for candidate in candidates:
+                if candidate.is_dir():
+                    n = sum(1 for _ in candidate.glob("*.npz"))
+                    if n > best_count:
+                        best, best_count = candidate, n
+            cache_dir = best
+
+        if cache_dir is None or not any(cache_dir.glob("*.npz")):
+            print("ERROR: No .npz files found. Use --cache-dir to specify the location.")
+            sys.exit(1)
+
+        count = sum(1 for _ in cache_dir.glob("*.npz"))
+        _log(f"Uploading {count} .npz files from {cache_dir}")
+        upload_embeddings_cache(cache_dir, username)
+        _merge_into_master_cache(cache_dir)
+        _print_cache_total(kaggle_total=count, label="Running total after upload")
+        sys.exit(0)
 
     if args.dry_run:
         ok = dry_run(config_path=config_path, enable_gpu=args.gpu, kernel_slug=args.slug)
@@ -962,6 +1618,7 @@ def main() -> None:
             no_overwrite=args.no_overwrite,
             upload_cache=args.upload_cache,
             upload_teacher_ckpt=args.upload_teacher_ckpt,
+            accumulate=args.accumulate,
         )
     sys.exit(0 if ok else 1)
 
