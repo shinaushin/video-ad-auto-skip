@@ -82,12 +82,6 @@ STRONG_PATTERNS = [
     re.compile(r"coupon code", re.I),
     re.compile(r"exclusive (?:discount|deal|offer|code) (?:for )?(?:my )?(?:viewers?|subscribers?|listeners?|audience)", re.I),
     re.compile(r"(?:my |our )?viewers? (?:get|receive|save|can get)", re.I),
-    # Sponsor disclosure / outro phrases — "thanks to X for sponsoring", etc.
-    re.compile(r"thanks?\s+(?:again\s+)?to\s+[\w\s]{1,30}\s+for\s+sponsor", re.I),
-    re.compile(r"thank\s+[\w]+\s+for\s+(?:sponsor|partner)", re.I),
-    re.compile(r"\bthis\s+(?:video|episode)\s+(?:is\s+)?(?:sponsor|brought)", re.I),
-    re.compile(r"\btoday(?:'s|s)?\s+(?:video\s+)?sponsor\b", re.I),
-    re.compile(r"\bour\s+sponsor(?:s)?\b", re.I),
 ]
 
 WEAK_PATTERNS = [
@@ -108,12 +102,11 @@ WEAK_PATTERNS = [
 # Detection tuning constants
 PADDING_BEFORE       = 3.0   # seconds before first keyword hit to include
 PADDING_AFTER        = 5.0   # seconds after last keyword hit to include
-MERGE_GAP_SEC        = 120   # merge clusters with gaps up to this many seconds
+MERGE_GAP_SEC        = 15    # merge clusters with gaps up to this many seconds
 WINDOW_SEC           = 25    # sliding window width for context-aware scoring
 MIN_SCORE            = 3     # minimum window score to flag (one strong hit = 3)
 MIN_SEGMENT_DURATION = 45.0  # floor: any detected segment is at least this long
 SILENCE_BOUNDARY_SEC = 1.5   # gap between consecutive cues treated as a break
-BOUNDARY_WALK_SEC    = 25    # max seconds to walk past cluster anchor when finding boundaries
 
 # Phrases that signal "sponsor is starting" — used for backward boundary walk
 SPONSOR_INTRO_PATTERNS = [
@@ -137,59 +130,16 @@ CONTENT_RETURN_PATTERNS = [
 ]
 
 
-# Pre-compiled combined patterns for fast scoring.
-# Each alternation is wrapped in a non-capturing group so findall returns
-# one entry per match, letting us count how many patterns fired.
-_STRONG_COMBINED = re.compile(
-    "|".join(f"(?:{p.pattern})" for p in STRONG_PATTERNS), re.I
-)
-_WEAK_COMBINED = re.compile(
-    "|".join(f"(?:{p.pattern})" for p in WEAK_PATTERNS), re.I
-)
-
-# Prefilter: a single fast regex whose match is a necessary (not sufficient)
-# condition for any STRONG or WEAK pattern to fire.  Only windows passing
-# this check proceed to the full pattern scan.  Uses sponsor-specific words
-# that are rare in normal speech to keep the false-positive rate low (~5%).
-_PREFILTER = re.compile(
-    r"sponsor|promo|coupon|affiliate|referral"
-    r"|brought\s+to\s+you"
-    r"|use\s+(?:my\s+|our\s+)?(?:code|link|referral)"
-    r"|(?:free|special)\s+trial"
-    r"|percent\s+off|\d+%\s+off"
-    r"|link\s+(?:is\s+)?in\s+(?:the\s+)?description"
-    r"|(?:visit|go\s+to|head\s+over\s+to)\s+\w+\.com"
-    r"|download\s+\w+\s+(?:app|today|now)"
-    r"|(?:get|try)\s+.{1,20}\s+for\s+free"
-    r"|sign\s+up"
-    r"|limited\s+time"
-    r"|money.?back\s+guarantee"
-    r"|exclusive\s+(?:deal|offer|discount|code)"
-    r"|thanks?\s+to\s+\w+\s+for\s+(?:sponsor|partner)"
-    r"|this\s+(?:video|episode)\s+(?:is\s+)?(?:sponsor|brought)"
-    r"|today.s\s+(?:video\s+)?sponsor"
-    r"|our\s+sponsors?\b",
-    re.I,
-)
-
-
 def score_text(text: str) -> int:
-    """Score a block of text for sponsor likelihood.
-
-    Two-stage fast path:
-    1. Cheap prefilter regex: skip windows with no sponsor-specific language.
-    2. Short-circuit on first STRONG match — score already ≥ MIN_SCORE (3).
-       Only count further if we need a precise total (rare).
-    """
-    if not _PREFILTER.search(text):
-        return 0
-    # One strong match already satisfies MIN_SCORE; check with search first.
-    if _STRONG_COMBINED.search(text):
-        # Count all strong matches for accurate scoring (affects cluster ranking).
-        score = len(_STRONG_COMBINED.findall(text)) * 3
-        score += len(_WEAK_COMBINED.findall(text))
-        return score
-    return len(_WEAK_COMBINED.findall(text))
+    """Score a block of text for sponsor likelihood."""
+    score = 0
+    for pat in STRONG_PATTERNS:
+        if pat.search(text):
+            score += 3
+    for pat in WEAK_PATTERNS:
+        if pat.search(text):
+            score += 1
+    return score
 
 
 # Keep the old name as an alias so tests and callers don't break
@@ -207,14 +157,14 @@ def _walk_boundary_back(cues: list[dict], from_idx: int) -> float:
 
     Falls back to cues[from_idx]["start"] if no boundary is found within
     the look-back window (we never walk past the start of the cluster's
-    cue or more than BOUNDARY_WALK_SEC seconds behind it).
+    cue or more than WINDOW_SEC seconds behind it).
     """
     anchor_start = cues[from_idx]["start"]
     best = anchor_start
     for i in range(from_idx, -1, -1):
         cue = cues[i]
-        # Don't walk more than BOUNDARY_WALK_SEC back from the anchor
-        if anchor_start - cue["start"] > BOUNDARY_WALK_SEC:
+        # Don't walk more than WINDOW_SEC back from the anchor
+        if anchor_start - cue["start"] > WINDOW_SEC:
             break
         # Silence gap: gap between cues[i-1].end and cues[i].start
         if i > 0:
@@ -245,8 +195,8 @@ def _walk_boundary_forward(cues: list[dict], from_idx: int) -> float:
     for i in range(from_idx, len(cues)):
         cue = cues[i]
         cue_end = cue["start"] + cue.get("dur", 0)
-        # Don't walk more than BOUNDARY_WALK_SEC forward from the anchor
-        if cue["start"] - anchor_end > BOUNDARY_WALK_SEC:
+        # Don't walk more than WINDOW_SEC forward from the anchor
+        if cue["start"] - anchor_end > WINDOW_SEC:
             break
         best = cue_end
         # Silence gap after this cue
@@ -283,29 +233,14 @@ def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
     half = WINDOW_SEC / 2
 
     # ── Step 1: score each cue against its sliding window ──
-    # Two-pointer slide: O(n) window construction instead of O(n²).
-    # Score cache: YouTube auto-captions emit near-duplicate cues in bursts;
-    # many adjacent windows are identical strings, so we skip re-scoring them.
     scored = []
-    left = 0
-    right = 0
-    n = len(cues)
-    _score_cache: dict[str, int] = {}
     for i, c in enumerate(cues):
         t = c["start"]
-        lo = t - half
-        hi = t + half
-        # Advance left pointer: drop cues that have fallen off the left edge
-        while left < i and cues[left]["start"] < lo:
-            left += 1
-        # Advance right pointer: include cues up to the right edge
-        while right < n - 1 and cues[right + 1]["start"] <= hi:
-            right += 1
-        window_text = " ".join(cues[j]["text"] for j in range(left, right + 1))
-        s = _score_cache.get(window_text)
-        if s is None:
-            s = score_text(window_text)
-            _score_cache[window_text] = s
+        window_text = " ".join(
+            x["text"] for x in cues
+            if t - half <= x["start"] <= t + half
+        )
+        s = score_text(window_text)
         if s >= MIN_SCORE:
             scored.append({**c, "end": c["start"] + c["dur"], "score": s})
 
@@ -516,28 +451,22 @@ def get_captions_for_video(
     import shutil
     if shutil.which("yt-dlp"):
         dbg("trying yt-dlp...")
-        try:
-            cues = _get_captions_via_ytdlp(
-                video_id,
-                cookies_from_browser=cookies_from_browser,
-                cookies_file=cookies_file,
-            )
-        except YtdlpError as e:
-            dbg(f"yt-dlp error — {e.reason}")
-            # Bot-blocks are transient — don't negative-cache so they're retried
-            if e.reason != "bot-blocked":
-                _save_caption_cache(video_id, None)
-            return None
-
+        cues = _get_captions_via_ytdlp(
+            video_id,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
+        )
         if cues:
             dbg(f"yt-dlp success — {len(cues)} cues")
             _save_caption_cache(video_id, cues)
             return cues
-        dbg("yt-dlp returned no captions (video may have no English subtitles)")
+        dbg("yt-dlp returned no cues (check: does the video have captions on YouTube?)")
     else:
         dbg("yt-dlp not found in PATH — skipping (install with: pip install yt-dlp)")
 
     # Cache the negative result so we don't retry this video on future runs.
+    # Exception: if yt-dlp exhausted retries (likely rate-limited), don't cache
+    # so the video is tried again on the next prefetch run.
     _save_caption_cache(video_id, None)
     return None
 
@@ -614,13 +543,6 @@ def _get_captions_via_html_session(video_id: str) -> list[dict] | None:
     return cues if cues else None
 
 
-class YtdlpError(Exception):
-    """Raised when yt-dlp exits with a recognisable error we want to surface."""
-    def __init__(self, reason: str):
-        self.reason = reason
-        super().__init__(reason)
-
-
 def _get_captions_via_ytdlp(
     video_id: str,
     cookies_from_browser: str | None = None,
@@ -633,10 +555,6 @@ def _get_captions_via_ytdlp(
     consent requirements better than any pure-Python HTTP approach.
     This function is a no-op if yt-dlp is not found in PATH.
 
-    Raises YtdlpError with a short reason string when yt-dlp exits with a
-    recognisable error (bot block, private/deleted video, etc.) so callers
-    can surface the reason rather than silently caching a negative result.
-
     Args:
         cookies_from_browser: Browser name to extract cookies from, e.g. "chrome",
             "firefox", "safari", "edge".  Passed as --cookies-from-browser to
@@ -646,192 +564,75 @@ def _get_captions_via_ytdlp(
             cookies_from_browser when you can't extract from the browser directly.
     """
     import shutil
-
-    if not shutil.which("yt-dlp"):
-        return None
-
-    # Prefer the Python API (same package as the CLI) — it lets us access
-    # subtitle data directly without the file-write / client-abort issues
-    # that plague the subprocess approach.
-    try:
-        import yt_dlp as _yt_dlp
-        return _get_captions_via_ytdlp_api(
-            video_id,
-            cookies_from_browser=cookies_from_browser,
-            cookies_file=cookies_file,
-        )
-    except ImportError:
-        pass  # fall through to subprocess fallback below
-
-    # ── Subprocess fallback (yt-dlp CLI only, no Python package) ────────
     import subprocess
     import tempfile
     import os as _os
 
+    if not shutil.which("yt-dlp"):
+        return None
+
+    # Retry up to 3 times to handle transient rate limits (HTTP 429)
     for attempt in range(3):
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 out_tmpl = _os.path.join(tmpdir, "%(id)s.%(ext)s")
-                auth_args = []
-                if cookies_from_browser:
-                    auth_args = ["--cookies-from-browser", cookies_from_browser]
-                elif cookies_file:
-                    auth_args = ["--cookies", cookies_file]
-
                 cmd = [
                     "yt-dlp",
-                    "--write-subs",
-                    "--write-auto-subs",
-                    "--sub-langs", "en",
+                    "--write-subs",       # manual (human) captions
+                    "--write-auto-subs",  # auto-generated captions
+                    "--sub-langs", "en.*",
                     "--skip-download",
                     "--no-playlist",
-                    "--no-warnings",
+                    "--quiet",
+                    # Use the tv_embedded client — it is far less aggressively
+                    # bot-filtered than the default web client.
+                    "--extractor-args", "youtube:player_client=tv_embedded",
                     "-o", out_tmpl,
-                ] + auth_args + [f"https://www.youtube.com/watch?v={video_id}"]
+                ]
+                if cookies_from_browser:
+                    cmd += ["--cookies-from-browser", cookies_from_browser]
+                elif cookies_file:
+                    cmd += ["--cookies", cookies_file]
+                cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=60, check=False,
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
                 )
+
+                # Detect rate-limiting: retry after a back-off
                 stdout = getattr(proc, "stdout", "") or ""
                 stderr = getattr(proc, "stderr", "") or ""
                 combined = (stdout + stderr).lower()
-
                 if "http error 429" in combined or "too many requests" in combined:
-                    time.sleep(10 * (2 ** attempt))
-                    continue
-                if "sign in to confirm" in combined or "bot" in combined:
-                    raise YtdlpError("bot-blocked")
-                if "private video" in combined:
-                    raise YtdlpError("private")
-                if "video unavailable" in combined or "not available" in combined:
-                    raise YtdlpError("unavailable")
-                if "has been removed" in combined:
-                    raise YtdlpError("deleted")
+                    wait = 10 * (2 ** attempt)  # 10 s, 20 s, 40 s
+                    time.sleep(wait)
+                    continue  # retry
 
-                for filename in sorted(_os.listdir(tmpdir)):
+                for filename in _os.listdir(tmpdir):
                     filepath = _os.path.join(tmpdir, filename)
-                    try:
-                        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-                            content = fh.read()
-                    except Exception:
-                        continue
+                    with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
                     if not content.strip():
                         continue
                     if filename.endswith(".vtt"):
                         cues = _parse_caption_vtt(content)
-                    elif filename.endswith((".srv3", ".json3")):
+                    elif filename.endswith(".srv3"):
                         cues = _parse_caption_json(content)
                     else:
                         cues = _parse_caption_xml(content) or _parse_caption_json(content)
                     if cues:
                         return cues
-                return None
 
-        except YtdlpError:
-            raise
+                return None  # yt-dlp ran but found no captions — not a transient error
+
         except Exception:
             pass
 
-    return None
-
-
-def _get_captions_via_ytdlp_api(
-    video_id: str,
-    cookies_from_browser: str | None = None,
-    cookies_file: str | None = None,
-) -> list[dict] | None:
-    """
-    Fetch captions using the yt-dlp Python API (import yt_dlp).
-
-    This bypasses the subprocess file-write approach entirely: we call
-    yt-dlp's extract_info() and read subtitle URLs directly from the
-    returned info dict, then fetch and parse the VTT content ourselves.
-    Avoids SABR abort issues, client selection problems, and temp-file races.
-    """
-    import yt_dlp as _yt_dlp
-    import urllib.request as _urllib_request
-
-    ydl_opts: dict = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        # Try multiple clients; web_creator + ios avoid SABR format errors.
-        "extractor_args": {"youtube": {"player_client": ["web_creator", "ios", "web"]}},
-    }
-    if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
-    elif cookies_file:
-        ydl_opts["cookiefile"] = cookies_file
-
-    try:
-        with _yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            url = f"https://www.youtube.com/watch?v={video_id}"
-            # process=False skips format selection entirely — subtitle URLs are
-            # populated by the extractor before that step, so we get them without
-            # triggering the "Requested format is not available" SABR error.
-            info = ydl.extract_info(url, download=False, process=False)
-    except _yt_dlp.utils.DownloadError as e:
-        msg = str(e).lower()
-        if "429" in msg or "too many requests" in msg:
-            raise YtdlpError("rate-limited")
-        if "private" in msg:
-            raise YtdlpError("private")
-        if "unavailable" in msg or "not available" in msg:
-            raise YtdlpError("unavailable")
-        if "removed" in msg:
-            raise YtdlpError("deleted")
-        if "sign in" in msg or "bot" in msg:
-            raise YtdlpError("bot-blocked")
-        raise YtdlpError(str(e)[:80])
-    except Exception as e:
-        raise YtdlpError(str(e)[:80])
-
-    if not info:
-        return None
-
-    # Collect subtitle track candidates: manual subs + auto-generated
-    # Both dicts map lang_code → list of format dicts with "url" and "ext".
-    candidates: list[dict] = []
-    for sub_dict in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
-        for lang, formats in sub_dict.items():
-            if not lang.startswith("en"):
-                continue
-            for fmt in (formats or []):
-                if fmt.get("url"):
-                    candidates.append(fmt)
-
-    if not candidates:
-        return None
-
-    # Prefer vtt > json3 > srv3 > anything else
-    def _fmt_rank(f: dict) -> int:
-        return {"vtt": 0, "json3": 1, "srv3": 2}.get(f.get("ext", ""), 99)
-
-    candidates.sort(key=_fmt_rank)
-
-    for fmt in candidates:
-        url = fmt.get("url", "")
-        ext = fmt.get("ext", "")
-        if not url:
-            continue
-        try:
-            req = _urllib_request.Request(url, headers={"User-Agent": BROWSER_UA})
-            with _urllib_request.urlopen(req, timeout=15) as resp:
-                content = resp.read().decode("utf-8", errors="replace")
-        except Exception:
-            continue
-
-        if ext == "vtt":
-            cues = _parse_caption_vtt(content)
-        elif ext in ("json3", "srv3"):
-            cues = _parse_caption_json(content)
-        else:
-            cues = _parse_caption_xml(content) or _parse_caption_json(content)
-
-        if cues:
-            return cues
-
-    return None
+    return None  # all retries exhausted (likely persistent rate limit)
 
 
 def _parse_caption_vtt(text: str) -> list[dict] | None:
@@ -1441,15 +1242,12 @@ def main():
             vid = tc["videoId"]
             if _caption_cache_path(vid).exists():
                 return vid, "cached"
-            try:
-                cues = get_captions_for_video(
-                    vid,
-                    cookies_from_browser=args.cookies_from_browser,
-                    cookies_file=args.cookies_file,
-                )
-                return vid, f"{len(cues)} cues" if cues else "no captions"
-            except YtdlpError as e:
-                return vid, f"yt-dlp error: {e.reason}"
+            cues = get_captions_for_video(
+                vid,
+                cookies_from_browser=args.cookies_from_browser,
+                cookies_file=args.cookies_file,
+            )
+            return vid, f"{len(cues)} cues" if cues else "no captions"
 
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {pool.submit(fetch_one, tc): tc for tc in test_cases}
@@ -1473,11 +1271,7 @@ def main():
 
     def run_one(idx_tc):
         idx, tc = idx_tc
-        # Only stagger if the caption is NOT already cached (live network request).
-        # With a pre-populated cache the sleep is pure waste — and idx*0.3 over
-        # 60k+ videos would add up to years of total sleep time.
-        if not _caption_cache_path(tc["videoId"]).exists():
-            time.sleep(min(idx * 0.3, 10))  # cap at 10 s regardless
+        time.sleep(idx * 0.3)  # stagger requests to be polite
         return idx, benchmark_video(
             tc["videoId"], tc["segments"],
             verbose=verbose,
