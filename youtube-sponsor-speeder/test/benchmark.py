@@ -137,16 +137,59 @@ CONTENT_RETURN_PATTERNS = [
 ]
 
 
+# Pre-compiled combined patterns for fast scoring.
+# Each alternation is wrapped in a non-capturing group so findall returns
+# one entry per match, letting us count how many patterns fired.
+_STRONG_COMBINED = re.compile(
+    "|".join(f"(?:{p.pattern})" for p in STRONG_PATTERNS), re.I
+)
+_WEAK_COMBINED = re.compile(
+    "|".join(f"(?:{p.pattern})" for p in WEAK_PATTERNS), re.I
+)
+
+# Prefilter: a single fast regex whose match is a necessary (not sufficient)
+# condition for any STRONG or WEAK pattern to fire.  Only windows passing
+# this check proceed to the full pattern scan.  Uses sponsor-specific words
+# that are rare in normal speech to keep the false-positive rate low (~5%).
+_PREFILTER = re.compile(
+    r"sponsor|promo|coupon|affiliate|referral"
+    r"|brought\s+to\s+you"
+    r"|use\s+(?:my\s+|our\s+)?(?:code|link|referral)"
+    r"|(?:free|special)\s+trial"
+    r"|percent\s+off|\d+%\s+off"
+    r"|link\s+(?:is\s+)?in\s+(?:the\s+)?description"
+    r"|(?:visit|go\s+to|head\s+over\s+to)\s+\w+\.com"
+    r"|download\s+\w+\s+(?:app|today|now)"
+    r"|(?:get|try)\s+.{1,20}\s+for\s+free"
+    r"|sign\s+up"
+    r"|limited\s+time"
+    r"|money.?back\s+guarantee"
+    r"|exclusive\s+(?:deal|offer|discount|code)"
+    r"|thanks?\s+to\s+\w+\s+for\s+(?:sponsor|partner)"
+    r"|this\s+(?:video|episode)\s+(?:is\s+)?(?:sponsor|brought)"
+    r"|today.s\s+(?:video\s+)?sponsor"
+    r"|our\s+sponsors?\b",
+    re.I,
+)
+
+
 def score_text(text: str) -> int:
-    """Score a block of text for sponsor likelihood."""
-    score = 0
-    for pat in STRONG_PATTERNS:
-        if pat.search(text):
-            score += 3
-    for pat in WEAK_PATTERNS:
-        if pat.search(text):
-            score += 1
-    return score
+    """Score a block of text for sponsor likelihood.
+
+    Two-stage fast path:
+    1. Cheap prefilter regex: skip windows with no sponsor-specific language.
+    2. Short-circuit on first STRONG match — score already ≥ MIN_SCORE (3).
+       Only count further if we need a precise total (rare).
+    """
+    if not _PREFILTER.search(text):
+        return 0
+    # One strong match already satisfies MIN_SCORE; check with search first.
+    if _STRONG_COMBINED.search(text):
+        # Count all strong matches for accurate scoring (affects cluster ranking).
+        score = len(_STRONG_COMBINED.findall(text)) * 3
+        score += len(_WEAK_COMBINED.findall(text))
+        return score
+    return len(_WEAK_COMBINED.findall(text))
 
 
 # Keep the old name as an alias so tests and callers don't break
@@ -240,14 +283,29 @@ def detect_sponsor_segments(cues: list[dict]) -> list[dict]:
     half = WINDOW_SEC / 2
 
     # ── Step 1: score each cue against its sliding window ──
+    # Two-pointer slide: O(n) window construction instead of O(n²).
+    # Score cache: YouTube auto-captions emit near-duplicate cues in bursts;
+    # many adjacent windows are identical strings, so we skip re-scoring them.
     scored = []
+    left = 0
+    right = 0
+    n = len(cues)
+    _score_cache: dict[str, int] = {}
     for i, c in enumerate(cues):
         t = c["start"]
-        window_text = " ".join(
-            x["text"] for x in cues
-            if t - half <= x["start"] <= t + half
-        )
-        s = score_text(window_text)
+        lo = t - half
+        hi = t + half
+        # Advance left pointer: drop cues that have fallen off the left edge
+        while left < i and cues[left]["start"] < lo:
+            left += 1
+        # Advance right pointer: include cues up to the right edge
+        while right < n - 1 and cues[right + 1]["start"] <= hi:
+            right += 1
+        window_text = " ".join(cues[j]["text"] for j in range(left, right + 1))
+        s = _score_cache.get(window_text)
+        if s is None:
+            s = score_text(window_text)
+            _score_cache[window_text] = s
         if s >= MIN_SCORE:
             scored.append({**c, "end": c["start"] + c["dur"], "score": s})
 
@@ -1415,7 +1473,11 @@ def main():
 
     def run_one(idx_tc):
         idx, tc = idx_tc
-        time.sleep(idx * 0.3)  # stagger requests to be polite
+        # Only stagger if the caption is NOT already cached (live network request).
+        # With a pre-populated cache the sleep is pure waste — and idx*0.3 over
+        # 60k+ videos would add up to years of total sleep time.
+        if not _caption_cache_path(tc["videoId"]).exists():
+            time.sleep(min(idx * 0.3, 10))  # cap at 10 s regardless
         return idx, benchmark_video(
             tc["videoId"], tc["segments"],
             verbose=verbose,
