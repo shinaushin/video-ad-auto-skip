@@ -339,7 +339,7 @@ def build_windows(
 # ---------------------------------------------------------------------------
 
 
-def _download_audio(video_id: str, out_dir: Path) -> Path | None:
+def _download_audio(video_id: str, out_dir: Path, cookies_path: Path | None = None) -> Path | None:
     """Download audio-only stream with yt-dlp; return path to opus/webm file."""
     out_template = str(out_dir / f"{video_id}.%(ext)s")
     cmd = [
@@ -348,9 +348,10 @@ def _download_audio(video_id: str, out_dir: Path) -> Path | None:
         "--no-warnings",
         "-f", "bestaudio[ext=webm]/bestaudio",
         "-o", out_template,
-        "--",
-        f"https://www.youtube.com/watch?v={video_id}",
     ]
+    if cookies_path is not None and cookies_path.exists():
+        cmd += ["--cookies", str(cookies_path)]
+    cmd += ["--", f"https://www.youtube.com/watch?v={video_id}"]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         log.debug("yt-dlp failed for %s: %s", video_id, result.stderr[:200])
@@ -530,6 +531,7 @@ def process_video(
     distilbert_tokenizer,
     device: str = "cpu",
     skip_audio: bool = False,
+    cookies_path: Path | None = None,
 ) -> bool:
     """Process one video end-to-end and write <cache_dir>/<video_id>.npz.
 
@@ -549,7 +551,7 @@ def process_video(
         video_duration = 0.0
 
         if not skip_audio:
-            audio_path = _download_audio(video_id, tmp_dir)
+            audio_path = _download_audio(video_id, tmp_dir, cookies_path=cookies_path)
             if audio_path is None:
                 log.warning("Audio download failed: %s", video_id)
                 return False
@@ -624,17 +626,19 @@ def run_batch(
     skip_audio: bool = False,
     seed: int = 42,
     extra_skip: set[str] | None = None,
+    cookies_path: Path | None = None,
 ) -> None:
     """Process up to ``n_videos`` random videos and cache their embeddings.
 
     Args:
-        csv_path:   Path to sponsorTimes.csv.
-        cache_dir:  Directory to write per-video .npz files.
-        n_videos:   Number of videos to process.
-        workers:    Parallel audio-download threads (yt-dlp tasks).
-        device:     PyTorch device string ("cuda" or "cpu").
-        skip_audio: Skip audio download/Whisper (text-only mode, faster).
-        seed:       Random seed for video sampling.
+        csv_path:     Path to sponsorTimes.csv.
+        cache_dir:    Directory to write per-video .npz files.
+        n_videos:     Number of videos to process.
+        workers:      Parallel audio-download threads (yt-dlp tasks).
+        device:       PyTorch device string ("cuda" or "cpu").
+        skip_audio:   Skip audio download/Whisper (text-only mode, faster).
+        seed:         Random seed for video sampling.
+        cookies_path: Path to Netscape cookies.txt for yt-dlp authentication.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -697,6 +701,7 @@ def run_batch(
                 distilbert_tokenizer=distilbert_tokenizer,
                 device=device,
                 skip_audio=skip_audio,
+                cookies_path=cookies_path,
             )
             if ok:
                 success += 1
@@ -826,6 +831,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=42, help="Random seed for video sampling")
     p.add_argument("--skip-ids", type=Path, default=None,
                    help="Path to a text file of already-processed video IDs (one per line) to skip.")
+    p.add_argument("--cookies", type=Path, default=None,
+                   help="Path to Netscape cookies.txt file for yt-dlp authentication (bypasses YouTube IP blocks).")
     args = p.parse_args()
 
     extra_skip: set[str] = set()
@@ -842,6 +849,7 @@ def main() -> None:
         skip_audio=args.skip_audio,
         seed=args.seed,
         extra_skip=extra_skip,
+        cookies_path=args.cookies,
     )
 
 
