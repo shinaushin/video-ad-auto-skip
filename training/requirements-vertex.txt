@@ -1,0 +1,21 @@
+# Python dependencies for the Vertex AI training container.
+# PyTorch itself comes from the base image (pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime).
+
+# ML / NLP
+transformers>=4.35.0
+soundfile>=0.12.1
+tqdm>=4.66.0
+numpy>=1.24.0
+
+# Hyperparameter search
+optuna>=3.4.0
+
+# ONNX export + validation
+onnx>=1.15.0
+onnxruntime>=1.16.0
+
+# GCP client libraries
+google-cloud-logging>=3.8.0
+google-cloud-monitoring>=2.18.0
+
+# yt-dlp is NOT included — data collection runs locally on Mac, not on Vertex AI.

@@ -339,32 +339,22 @@ def build_windows(
 # ---------------------------------------------------------------------------
 
 
-def _download_audio(video_id: str, out_dir: Path, cookies_path: Path | None = None,
-                    cookies_from_browser: str | None = None,
-                    sleep_interval: float = 0.0) -> Path | None:
+def _download_audio(video_id: str, out_dir: Path, cookies_path: Path | None = None) -> Path | None:
     """Download audio-only stream with yt-dlp; return path to opus/webm file."""
     out_template = str(out_dir / f"{video_id}.%(ext)s")
     cmd = [
         "yt-dlp",
         "--quiet",
         "--no-warnings",
-        "--js-runtimes", "node",          # needed for YouTube n-challenge signature decryption
-        "--remote-components", "ejs:github",  # downloads challenge solver script from GitHub
         "-f", "bestaudio[ext=webm]/bestaudio",
         "-o", out_template,
     ]
-    if cookies_from_browser:
-        cmd += ["--cookies-from-browser", cookies_from_browser]
-    elif cookies_path is not None and cookies_path.exists():
+    if cookies_path is not None and cookies_path.exists():
         cmd += ["--cookies", str(cookies_path)]
-    if sleep_interval > 0:
-        cmd += ["--sleep-requests", str(sleep_interval),
-                "--sleep-interval", str(sleep_interval)]
     cmd += ["--", f"https://www.youtube.com/watch?v={video_id}"]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
-        log.warning("yt-dlp failed for %s (rc=%d): %s", video_id, result.returncode,
-                    (result.stderr or result.stdout)[:300])
+        log.debug("yt-dlp failed for %s: %s", video_id, result.stderr[:200])
         return None
     # Find the downloaded file.
     for ext in ("webm", "opus", "m4a", "mp3", "ogg"):
@@ -440,67 +430,41 @@ def compute_whisper_embeddings(
     N = len(windows)
     embs = np.zeros((N, WHISPER_DIM), dtype=np.float32)
 
-    _logged_audio_load_error = False  # log first failure only to avoid spam
-
     with tempfile.TemporaryDirectory(prefix="whisper_slice_") as tmp:
         tmp_dir = Path(tmp)
         for i, w in enumerate(windows):
             slice_path = tmp_dir / f"slice_{i}.wav"
             ok = _slice_audio_segment(audio_path, w["t_start"], w["t_end"], slice_path)
             if not ok:
-                if i == 0:
-                    log.warning("ffmpeg slice failed for window 0 of %s — check ffmpeg install", audio_path.name)
                 continue
-
-            audio_data = None
             try:
                 import soundfile as sf
                 audio_data, sr = sf.read(str(slice_path))
                 if audio_data.ndim > 1:
                     audio_data = audio_data.mean(axis=1)
-            except Exception as sf_exc:
+            except Exception:
+                # Fall back to librosa if soundfile unavailable.
                 try:
                     import librosa
                     audio_data, sr = librosa.load(str(slice_path), sr=16000, mono=True)
-                except Exception as lb_exc:
-                    if not _logged_audio_load_error:
-                        log.warning(
-                            "Cannot read audio slices — soundfile error: %s | librosa error: %s. "
-                            "Install soundfile: pip install soundfile",
-                            sf_exc, lb_exc,
-                        )
-                        _logged_audio_load_error = True
+                except Exception:
                     continue
-
-            if audio_data is None:
-                continue
 
             try:
                 inputs = processor(
                     audio_data,
                     sampling_rate=16000,
                     return_tensors="pt",
-                    padding="max_length",  # pad to 3000 mel frames (Whisper's fixed input size)
+                    padding=True,
                 )
                 input_features = inputs["input_features"].to(device)
                 with torch.no_grad():
-                    encoder_out = model.encoder(input_features)
+                    encoder_out = model.model.encoder(input_features)
                     # encoder_out.last_hidden_state: [1, T, 384]
-                    # T=1500 always (Whisper fixed input), but only the first
-                    # n_real_frames correspond to actual audio — the rest is
-                    # silence padding.  Pool only over real frames to avoid
-                    # diluting the embedding with zeros.
-                    # Whisper mel: 100 frames/sec; encoder downsamples by 2x → 50/sec.
-                    audio_duration_sec = len(audio_data) / 16000
-                    n_real_frames = max(1, min(int(audio_duration_sec * 50),
-                                               encoder_out.last_hidden_state.shape[1]))
-                    emb = encoder_out.last_hidden_state[0, :n_real_frames, :].mean(dim=0)
+                    emb = encoder_out.last_hidden_state.mean(dim=1).squeeze(0)
                 embs[i] = emb.cpu().float().numpy()
             except Exception as exc:
-                if i == 0:
-                    log.warning("Whisper encoder failed for window 0: %s", exc, exc_info=True)
-                else:
-                    log.debug("Whisper encoding failed for window %d: %s", i, exc)
+                log.debug("Whisper encoding failed for window %d: %s", i, exc)
 
     return embs
 
@@ -568,27 +532,15 @@ def process_video(
     device: str = "cpu",
     skip_audio: bool = False,
     cookies_path: Path | None = None,
-    cookies_from_browser: str | None = None,
-    sleep_interval: float = 0.0,
-    force: bool = False,
-    force_zero_audio: bool = False,
 ) -> bool:
     """Process one video end-to-end and write <cache_dir>/<video_id>.npz.
 
     Returns True on success.
     """
     out_path = cache_dir / f"{video_id}.npz"
-    if out_path.exists() and not force:
-        if force_zero_audio:
-            # Only re-process if audio embeddings are all zero.
-            data = np.load(out_path)
-            if np.any(data["audio_embs"]):
-                log.debug("Cache hit (good audio): %s", video_id)
-                return True
-            log.info("Re-processing %s: audio embeddings are all zero", video_id)
-        else:
-            log.debug("Cache hit: %s", video_id)
-            return True
+    if out_path.exists():
+        log.debug("Cache hit: %s", video_id)
+        return True
 
     # Fetch captions.
     cues = fetch_video_captions(video_id)
@@ -599,9 +551,7 @@ def process_video(
         video_duration = 0.0
 
         if not skip_audio:
-            audio_path = _download_audio(video_id, tmp_dir, cookies_path=cookies_path,
-                                         cookies_from_browser=cookies_from_browser,
-                                         sleep_interval=sleep_interval)
+            audio_path = _download_audio(video_id, tmp_dir, cookies_path=cookies_path)
             if audio_path is None:
                 log.warning("Audio download failed: %s", video_id)
                 return False
@@ -638,21 +588,6 @@ def process_video(
             )
         else:
             audio_embs = np.zeros((N, WHISPER_DIM), dtype=np.float32)
-
-        # Spot-check: log first window's audio embedding snippet so we can
-        # visually confirm embeddings are non-zero.
-        first_nonzero = next(
-            (i for i in range(len(audio_embs)) if np.any(audio_embs[i])), None
-        )
-        if first_nonzero is not None:
-            snippet = audio_embs[first_nonzero, :8]
-            log.info(
-                "  audio_emb[win=%d] snippet: [%s]",
-                first_nonzero,
-                ", ".join(f"{v:.4f}" for v in snippet),
-            )
-        else:
-            log.warning("  audio_embs: ALL ZERO for %s — Whisper may have failed", video_id)
 
         # DistilBERT embeddings.
         if distilbert_model is not None:
@@ -692,23 +627,18 @@ def run_batch(
     seed: int = 42,
     extra_skip: set[str] | None = None,
     cookies_path: Path | None = None,
-    cookies_from_browser: str | None = None,
-    sleep_interval: float = 0.0,
-    force: bool = False,
-    force_zero_audio: bool = False,
 ) -> None:
     """Process up to ``n_videos`` random videos and cache their embeddings.
 
     Args:
-        csv_path:       Path to sponsorTimes.csv.
-        cache_dir:      Directory to write per-video .npz files.
-        n_videos:       Number of videos to process.
-        workers:        Parallel audio-download threads (yt-dlp tasks).
-        device:         PyTorch device string ("cuda" or "cpu").
-        skip_audio:     Skip audio download/Whisper (text-only mode, faster).
-        seed:           Random seed for video sampling.
-        cookies_path:   Path to Netscape cookies.txt for yt-dlp authentication.
-        sleep_interval: Seconds to sleep between yt-dlp HTTP requests (reduces 429s).
+        csv_path:     Path to sponsorTimes.csv.
+        cache_dir:    Directory to write per-video .npz files.
+        n_videos:     Number of videos to process.
+        workers:      Parallel audio-download threads (yt-dlp tasks).
+        device:       PyTorch device string ("cuda" or "cpu").
+        skip_audio:   Skip audio download/Whisper (text-only mode, faster).
+        seed:         Random seed for video sampling.
+        cookies_path: Path to Netscape cookies.txt for yt-dlp authentication.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -719,18 +649,10 @@ def run_batch(
     all_ids = list(sponsor_map.keys())
     random.seed(seed)
     random.shuffle(all_ids)
-    # Skip already-cached (unless --force / --force-zero-audio) and any IDs passed via --skip-ids.
+    # Skip already-cached and any IDs passed via --skip-ids.
     skip_set = set(extra_skip) if extra_skip else set()
-    if force:
-        uncached = [v for v in all_ids if v not in skip_set]
-        log.info("--force: will overwrite all existing cached files")
-    elif force_zero_audio:
-        # Include all videos (zero-audio check happens inside process_video).
-        uncached = [v for v in all_ids if v not in skip_set]
-        log.info("--force-zero-audio: will re-process videos with all-zero audio embeddings")
-    else:
-        uncached = [v for v in all_ids
-                    if not (cache_dir / f"{v}.npz").exists() and v not in skip_set]
+    uncached = [v for v in all_ids
+                if not (cache_dir / f"{v}.npz").exists() and v not in skip_set]
     target = uncached[:n_videos]
 
     log.info("Processing %d videos (%d already cached, %d skipped by ID list)",
@@ -746,30 +668,10 @@ def run_batch(
         try:
             from transformers import WhisperModel, WhisperProcessor
             whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
-            whisper_model = WhisperModel.from_pretrained("openai/whisper-tiny")
-            try:
-                whisper_model = whisper_model.to(device)
-                # Smoke-test: verify the device actually works for Whisper ops.
-                import torch
-                _dummy = torch.zeros(1, 80, 3000, device=device)
-                with torch.no_grad():
-                    whisper_model.encoder(_dummy)
-                log.info("Whisper loaded on %s ✓", device)
-            except Exception as device_exc:
-                log.warning(
-                    "Whisper failed on device=%s (%s) — falling back to CPU. "
-                    "This is normal for MPS; Whisper uses ops not fully supported there.",
-                    device, device_exc,
-                )
-                whisper_model = whisper_model.to("cpu")
-                device = "cpu"
-                log.info("Whisper loaded on cpu ✓ (DistilBERT will also use cpu)")
+            whisper_model = WhisperModel.from_pretrained("openai/whisper-tiny").to(device)
             whisper_model.eval()
         except Exception as exc:
-            log.error(
-                "Whisper failed to load entirely — audio embeddings will be skipped. "
-                "Error: %s", exc, exc_info=True,
-            )
+            log.warning("Whisper not available — skipping audio embeddings: %s", exc)
             skip_audio = True
 
     log.info("Loading DistilBERT…")
@@ -800,10 +702,6 @@ def run_batch(
                 device=device,
                 skip_audio=skip_audio,
                 cookies_path=cookies_path,
-                cookies_from_browser=cookies_from_browser,
-                sleep_interval=sleep_interval,
-                force=force,
-                force_zero_audio=force_zero_audio,
             )
             if ok:
                 success += 1
@@ -853,23 +751,15 @@ class SponsorDataset:
 
         # Flatten all windows into a list of (video_id, window_index) pairs.
         self._index: list[tuple[str, int]] = []
-        skipped_audio = 0
         for vid in self.video_ids:
             path = cache_dir / f"{vid}.npz"
             if not path.exists():
                 continue
             data = np.load(path)
-            # Skip videos whose audio embeddings are all-zero (failed yt-dlp download).
-            if self.require_audio and not np.any(data["audio_embs"]):
-                log.debug("Skipping %s: all-zero audio embeddings (failed download)", vid)
-                skipped_audio += 1
-                continue
             n = len(data["labels"])
             self._index.extend((vid, i) for i in range(n))
 
-        if skipped_audio:
-            log.info("SponsorDataset: skipped %d videos with all-zero audio embeddings", skipped_audio)
-        log.info("SponsorDataset: %d windows across %d videos", len(self._index), len(self.video_ids) - skipped_audio)
+        log.info("SponsorDataset: %d windows across %d videos", len(self._index), len(self.video_ids))
 
     def __len__(self) -> int:
         return len(self._index)
@@ -942,18 +832,7 @@ def main() -> None:
     p.add_argument("--skip-ids", type=Path, default=None,
                    help="Path to a text file of already-processed video IDs (one per line) to skip.")
     p.add_argument("--cookies", type=Path, default=None,
-                   help="Path to Netscape cookies.txt file for yt-dlp authentication.")
-    p.add_argument("--cookies-from-browser", type=str, default=None,
-                   dest="cookies_from_browser",
-                   help="Browser to read cookies from directly, e.g. 'chrome', 'safari', 'firefox'. "
-                        "More reliable than --cookies for YouTube bot checks.")
-    p.add_argument("--sleep", type=float, default=0.0,
-                   help="Seconds to sleep between yt-dlp HTTP requests (helps reduce 429 rate limiting).")
-    p.add_argument("--force", action="store_true",
-                   help="Re-process and overwrite all already-cached .npz files.")
-    p.add_argument("--force-zero-audio", action="store_true",
-                   help="Re-process only cached videos whose audio embeddings are all zero. "
-                        "Skips videos that already have good audio. Use this to resume after fixing Whisper.")
+                   help="Path to Netscape cookies.txt file for yt-dlp authentication (bypasses YouTube IP blocks).")
     args = p.parse_args()
 
     extra_skip: set[str] = set()
@@ -971,10 +850,6 @@ def main() -> None:
         seed=args.seed,
         extra_skip=extra_skip,
         cookies_path=args.cookies,
-        cookies_from_browser=args.cookies_from_browser,
-        sleep_interval=args.sleep,
-        force=args.force,
-        force_zero_audio=args.force_zero_audio,
     )
 
 
