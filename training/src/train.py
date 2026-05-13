@@ -34,16 +34,23 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+try:
+    from gcp_utils import MetricsReporter, setup_cloud_logging, download_from_gcs, upload_to_gcs, load_config
+    _HAS_GCP_UTILS = True
+except ImportError:
+    _HAS_GCP_UTILS = False
 
 from data_pipeline import SponsorDataset, N_MFCC_FRAMES
 from models import (
@@ -409,7 +416,7 @@ def _eval_teacher_with_thresholds(
     return total_loss / n, metrics, curve
 
 
-def train_teacher(cfg: dict, device: str) -> Path:
+def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None) -> Path:
     """Train the teacher model and return the checkpoint path."""
     cache_dir = Path(cfg["cache_dir"])
     output_dir = Path(cfg["output_dir"])
@@ -426,20 +433,17 @@ def train_teacher(cfg: dict, device: str) -> Path:
     log.info("Split: %d train / %d val / %d test videos",
              len(train_ids), len(val_ids), len(test_ids))
 
-    train_ds = TeacherSequenceDataset(SponsorDataset(cache_dir, train_ids))
-    val_ds   = TeacherSequenceDataset(SponsorDataset(cache_dir, val_ids))
+    train_ds = TeacherSequenceDataset(SponsorDataset(cache_dir, train_ids, require_audio=False))
+    val_ds   = TeacherSequenceDataset(SponsorDataset(cache_dir, val_ids, require_audio=False))
 
-    # Compute actual class ratio from training data for pos_weight.
+    # Log class counts for reference (no pos_weight — WeightedRandomSampler handles
+    # class imbalance at the batch level; adding pos_weight on top double-corrects
+    # and causes the model to over-predict sponsor).
     n_pos = sum(w["label"] for seq in train_ds._sequences for w in seq)
     n_neg = sum(1 - w["label"] for seq in train_ds._sequences for w in seq)
-    base_pw       = n_neg / max(n_pos, 1)
-    # pos_weight_mult scales the computed ratio (Optuna tunes this).
-    # pos_weight overrides the whole value directly (manual control).
-    pw_mult       = float(cfg.get("pos_weight_mult", 1.0))
-    pos_weight_val = float(cfg.get("pos_weight", base_pw * pw_mult))
     log.info(
-        "Class counts — pos: %d  neg: %d  base_pw=%.1f  mult=%.2f  → pos_weight=%.1f",
-        n_pos, n_neg, base_pw, pw_mult, pos_weight_val,
+        "Class counts — pos: %d  neg: %d  ratio=%.1f  (sampler balances batches; pos_weight=1.0)",
+        n_pos, n_neg, n_neg / max(n_pos, 1),
     )
 
     # Weight each video by whether it contains at least one sponsor window.
@@ -462,13 +466,10 @@ def train_teacher(cfg: dict, device: str) -> Path:
     model       = TeacherModel(lstm_hidden=lstm_hidden, dropout=dropout).to(device)
     optimizer   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
-    # BCEWithLogitsLoss + pos_weight is more direct than FocalLoss for severe
-    # class imbalance: it scales the positive-class gradient by the actual
-    # neg/pos ratio, forcing the model to treat each sponsor window as worth
-    # pos_weight non-sponsor windows.
-    criterion = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor([pos_weight_val], device=device)
-    )
+    # BCEWithLogitsLoss with neutral pos_weight — class imbalance is handled
+    # entirely by WeightedRandomSampler above.  Using pos_weight on top of the
+    # sampler double-corrects and drives the model to over-predict sponsor.
+    criterion = nn.BCEWithLogitsLoss()
 
     best_val_f1      = -1.0   # track F1; higher = better (prevents collapse to all-zero)
     best_val_loss    = float("inf")  # kept for logging only
@@ -486,8 +487,7 @@ def train_teacher(cfg: dict, device: str) -> Path:
         "best_val_loss": float("inf"),
     }
 
-    log.info("Starting teacher training: %d epochs, %d videos/batch, pos_weight=%.1f",
-             epochs, seq_batch, pos_weight_val)
+    log.info("Starting teacher training: %d epochs, %d videos/batch", epochs, seq_batch)
     log.info("Early stopping: patience=%d epochs on val_f1 (not val_loss)", patience)
 
     for epoch in range(1, epochs + 1):
@@ -521,6 +521,20 @@ def train_teacher(cfg: dict, device: str) -> Path:
         training_log["epochs"].append(ep_entry)
 
         val_f1 = val_m["f1"]
+
+        # ── Cloud Monitoring ──────────────────────────────────────────────
+        if reporter is not None:
+            current_lr = optimizer.param_groups[0]["lr"]
+            reporter.emit_epoch(
+                epoch,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                val_f1=val_f1,
+                val_precision=val_m.get("precision", 0.0),
+                val_recall=val_m.get("recall", 0.0),
+                lr=current_lr,
+            )
+
         # Use val_f1 strictly for early stopping — no val_loss tiebreak.
         # A tiebreak on val_loss would reset patience every epoch when f1=0
         # (loss slowly decreases toward the all-negative optimum), preventing
@@ -551,7 +565,7 @@ def train_teacher(cfg: dict, device: str) -> Path:
     state = torch.load(best_ckpt, map_location=device)
     model.load_state_dict(state["model_state_dict"])
 
-    test_ds     = TeacherSequenceDataset(SponsorDataset(cache_dir, test_ids))
+    test_ds     = TeacherSequenceDataset(SponsorDataset(cache_dir, test_ids, require_audio=False))
     test_loader = DataLoader(
         test_ds, batch_size=seq_batch, shuffle=False,
         collate_fn=collate_teacher_sequences, num_workers=0,
@@ -718,7 +732,7 @@ def _run_student_epoch(
     return total_loss / max(total, 1), correct / max(total, 1)
 
 
-def train_distill(cfg: dict, device: str) -> Path:
+def train_distill(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None) -> Path:
     """Train the student model via knowledge distillation from the teacher."""
     cache_dir = Path(cfg["cache_dir"])
     output_dir = Path(cfg["output_dir"])
@@ -743,7 +757,7 @@ def train_distill(cfg: dict, device: str) -> Path:
         log.info("Loading teacher for logit collection: %s", teacher_ckpt)
         teacher = load_teacher(teacher_ckpt, device=device)
         for split_ids in (train_ids, val_ids):
-            split_ds = SponsorDataset(cache_dir, split_ids)
+            split_ds = SponsorDataset(cache_dir, split_ids, require_audio=False)
             teacher_logits.update(collect_teacher_logits(teacher, split_ds, device))
         del teacher
         if device == "cuda":
@@ -752,8 +766,8 @@ def train_distill(cfg: dict, device: str) -> Path:
         log.warning("No teacher checkpoint provided — using hard labels only (alpha→0)")
         kd_alpha = 0.0
 
-    train_ds = StudentWindowDataset(SponsorDataset(cache_dir, train_ids), teacher_logits)
-    val_ds = StudentWindowDataset(SponsorDataset(cache_dir, val_ids), teacher_logits)
+    train_ds = StudentWindowDataset(SponsorDataset(cache_dir, train_ids, require_audio=False), teacher_logits)
+    val_ds = StudentWindowDataset(SponsorDataset(cache_dir, val_ids, require_audio=False), teacher_logits)
 
     train_labels = [int(d[2].item()) for d in train_ds]
     sampler = make_balanced_sampler(train_labels)
@@ -805,6 +819,16 @@ def train_distill(cfg: dict, device: str) -> Path:
         }
         training_log["epochs"].append(ep_entry)
 
+        # ── Cloud Monitoring ──────────────────────────────────────────────
+        if reporter is not None:
+            current_lr = optimizer.param_groups[0]["lr"]
+            reporter.emit_epoch(
+                epoch,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                lr=current_lr,
+            )
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -844,7 +868,7 @@ def evaluate_baseline(cfg: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     _, _, test_ids = SponsorDataset.train_val_test_split(cache_dir)
-    test_ds = SponsorDataset(cache_dir, test_ids)
+    test_ds = SponsorDataset(cache_dir, test_ids, require_audio=False)
 
     _WEIGHTS = {0: 3.0, 1: 1.5, 2: 1.5, 3: 0.5}
     _GROUPS = [g for (_, g) in [(None, 0)] * 16 + [(None, 1)] * 16 + [(None, 2)] * 16 + [(None, 3)] * 16]
@@ -895,21 +919,57 @@ def main() -> None:
     )
 
     p = argparse.ArgumentParser(description="Train teacher or student model.")
-    p.add_argument("--config", required=True, type=Path, help="Path to phase config JSON.")
+    p.add_argument("--config", required=True, type=str,
+                   help="Path to phase config JSON (local or gs:// URI).")
+    # GCS I/O — used by Vertex AI jobs.
+    p.add_argument("--gcs-input", type=str, default=None,
+                   help="GCS URI of embedding cache (gs://bucket/embeddings). "
+                        "Downloaded to --local-data before training.")
+    p.add_argument("--local-data", type=str, default="/tmp/embeddings_cache",
+                   help="Local directory for downloaded embeddings cache.")
+    p.add_argument("--gcs-output", type=str, default=None,
+                   help="GCS URI to upload output dir after training "
+                        "(gs://bucket/outputs/run). Also accepts $AIP_MODEL_DIR.")
+    # Cloud Logging / Monitoring.
+    p.add_argument("--cloud-logging", action="store_true",
+                   help="Attach a Cloud Logging handler to the root logger.")
+    p.add_argument("--job-name", type=str, default="yt-sponsor-train",
+                   help="Display name for Cloud Logging log and Monitoring labels.")
     args = p.parse_args()
 
-    cfg = json.loads(args.config.read_text())
+    # ── Cloud Logging ──────────────────────────────────────────────────────
+    if args.cloud_logging and _HAS_GCP_UTILS:
+        setup_cloud_logging(args.job_name)
+
+    # ── Load config (local or GCS) ─────────────────────────────────────────
+    if _HAS_GCP_UTILS:
+        cfg = load_config(args.config)
+    else:
+        cfg = json.loads(Path(args.config).read_text())
+
     phase = cfg.get("phase", "teacher")
 
-    # Device selection.
+    # ── GCS input: download embeddings ────────────────────────────────────
+    gcs_output = args.gcs_output or os.environ.get("AIP_MODEL_DIR", "")
+    if args.gcs_input and _HAS_GCP_UTILS:
+        log.info("Downloading embeddings from GCS: %s → %s", args.gcs_input, args.local_data)
+        ok = download_from_gcs(args.gcs_input, args.local_data)
+        if not ok:
+            log.error("Failed to download embeddings — aborting.")
+            raise SystemExit(1)
+        # Override cache_dir in config to the local copy.
+        cfg["cache_dir"] = args.local_data
+        log.info("cfg['cache_dir'] overridden to %s", args.local_data)
+
+    # ── Device selection ───────────────────────────────────────────────────
     device_pref = cfg.get("device", "auto")
     if device_pref == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = device_pref
-    log.info("Phase: %s  Device: %s", phase, device)
+    log.info("Phase: %s  Device: %s  Job: %s", phase, device, args.job_name)
 
-    # Reproducibility.
+    # ── Reproducibility ────────────────────────────────────────────────────
     seed = int(cfg.get("seed", 42))
     random.seed(seed)
     np.random.seed(seed)
@@ -917,14 +977,26 @@ def main() -> None:
     if device == "cuda":
         torch.cuda.manual_seed_all(seed)
 
+    # ── Cloud Monitoring reporter ──────────────────────────────────────────
+    reporter = None
+    if _HAS_GCP_UTILS:
+        reporter = MetricsReporter(phase=phase, job_name=args.job_name)
+
+    # ── Train ──────────────────────────────────────────────────────────────
     if phase == "teacher":
-        train_teacher(cfg, device)
+        train_teacher(cfg, device, reporter=reporter)
     elif phase == "distill":
-        train_distill(cfg, device)
+        train_distill(cfg, device, reporter=reporter)
     elif phase == "baseline":
         evaluate_baseline(cfg)
     else:
         raise ValueError(f"Unknown phase: {phase!r}. Expected: teacher | distill | baseline")
+
+    # ── GCS output: upload results ─────────────────────────────────────────
+    if gcs_output and _HAS_GCP_UTILS:
+        output_dir = cfg.get("output_dir", "/tmp/outputs")
+        log.info("Uploading outputs to GCS: %s → %s", output_dir, gcs_output)
+        upload_to_gcs(output_dir, gcs_output)
 
 
 if __name__ == "__main__":
