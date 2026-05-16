@@ -14,6 +14,9 @@ optuna>=3.4.0
 onnx>=1.15.0
 onnxruntime>=1.16.0
 
+# Experiment tracking
+tensorboard>=2.15.0
+
 # GCP client libraries
 google-cloud-logging>=3.8.0
 google-cloud-monitoring>=2.18.0

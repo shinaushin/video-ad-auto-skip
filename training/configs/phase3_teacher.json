@@ -1,9 +1,9 @@
 {
   "name": "yt-sponsor-phase3-teacher",
   "phase": "teacher",
-  "description": "Train teacher model (DistilBERT + Whisper-tiny + CrossAttention + BiLSTM).",
-  "cache_dir": "/kaggle/working/embeddings_cache",
-  "output_dir": "/kaggle/working/outputs",
+  "description": "Train teacher model (DistilBERT + Whisper-tiny + CrossAttention + BiLSTM) on Vertex AI.",
+  "cache_dir": "/tmp/embeddings_cache",
+  "output_dir": "/tmp/outputs/teacher",
   "epochs": 200,
   "seq_batch_size": 8,
   "lr": 5e-4,
