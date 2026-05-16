@@ -1,0 +1,15 @@
+# Embedding cache — large, downloaded from GCS at runtime
+training/cache/
+
+# Kaggle outputs and local job outputs
+training/kaggle_outputs/
+training/outputs/
+
+# Python bytecode
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Local development / test artifacts
+**/.pytest_cache/
+**/*.egg-info/
