@@ -52,9 +52,16 @@ try:
 except ImportError:
     _HAS_GCP_UTILS = False
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _HAS_TB = True
+except ImportError:
+    _HAS_TB = False
+
 from data_pipeline import SponsorDataset, N_MFCC_FRAMES
 from models import (
     DISTILBERT_DIM,
+    K_CONTEXT,
     MFCC_DIM,
     N_FRAMES,
     TEXT_DIM,
@@ -196,7 +203,7 @@ class StudentWindowDataset(Dataset):
     ) -> None:
         self._items: list[dict] = list(sponsor_ds)
         self._teacher_logits = teacher_logits or {}
-        # Pre-index items by (video_id, window_idx) for teacher logit lookup.
+        # Pre-index items by (video_id, window_idx) for teacher logit / context lookup.
         self._keys: list[tuple[str, int]] = []
         vid_counter: dict[str, int] = {}
         for item in self._items:
@@ -204,13 +211,15 @@ class StudentWindowDataset(Dataset):
             idx = vid_counter.get(vid, 0)
             self._keys.append((vid, idx))
             vid_counter[vid] = idx + 1
+        # Total window count per video (for position normalisation).
+        self._vid_total: dict[str, int] = vid_counter
 
     def __len__(self) -> int:
         return len(self._items)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         item = self._items[idx]
-        keyword_vec = torch.from_numpy(item["keyword_vec"])   # [64]
+        keyword_vec = torch.from_numpy(item["keyword_vec"])   # [128]
 
         # Construct surrogate MFCC from Whisper embedding: project 384 → 13, tile N_FRAMES.
         audio_emb = torch.from_numpy(item["audio_emb"])       # [384]
@@ -227,6 +236,7 @@ class StudentWindowDataset(Dataset):
 
         # Teacher soft label: logit from teacher inference (or fall back to hard label).
         key = self._keys[idx]
+        vid, w_idx = key
         teacher_logit_val = self._teacher_logits.get(key, None)
         if teacher_logit_val is not None:
             teacher_logit = torch.tensor(teacher_logit_val, dtype=torch.float32)
@@ -234,7 +244,23 @@ class StudentWindowDataset(Dataset):
             # No teacher logit available — encode hard label as logit.
             teacher_logit = torch.tensor(10.0 if item["label"] else -10.0, dtype=torch.float32)
 
-        return keyword_vec, mfcc, hard_label, teacher_logit
+        # Context: last K_CONTEXT teacher sigmoid probs (0.5 if window doesn't exist).
+        context = []
+        for k in range(1, K_CONTEXT + 1):
+            prev_logit = self._teacher_logits.get((vid, w_idx - k), None)
+            if prev_logit is not None:
+                context.append(float(torch.sigmoid(torch.tensor(prev_logit))))
+            else:
+                context.append(0.5)
+        context_input = torch.tensor(context, dtype=torch.float32)  # [K_CONTEXT]
+
+        # Position: normalised window index within the video [0, 1].
+        total = self._vid_total.get(vid, 1)
+        position_input = torch.tensor(
+            [w_idx / max(total - 1, 1)], dtype=torch.float32
+        )  # [1]
+
+        return keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +502,12 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
     epochs_no_improve = 0
     best_ckpt        = output_dir / "teacher_best.pt"
 
+    writer = None
+    if _HAS_TB:
+        tb_dir = output_dir / "tb"
+        writer = SummaryWriter(log_dir=str(tb_dir))
+        log.info("TensorBoard logs → %s", tb_dir)
+
     training_log: dict = {
         "phase": "teacher",
         "n_train_videos": len(train_ids),
@@ -522,9 +554,20 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
 
         val_f1 = val_m["f1"]
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # ── TensorBoard ───────────────────────────────────────────────────
+        if writer is not None:
+            writer.add_scalar("train/loss",    train_loss,                epoch)
+            writer.add_scalar("train/f1",      train_m["f1"],             epoch)
+            writer.add_scalar("val/loss",      val_loss,                  epoch)
+            writer.add_scalar("val/f1",        val_f1,                    epoch)
+            writer.add_scalar("val/precision", val_m.get("precision", 0), epoch)
+            writer.add_scalar("val/recall",    val_m.get("recall", 0),    epoch)
+            writer.add_scalar("lr",            current_lr,                epoch)
+
         # ── Cloud Monitoring ──────────────────────────────────────────────
         if reporter is not None:
-            current_lr = optimizer.param_groups[0]["lr"]
             reporter.emit_epoch(
                 epoch,
                 train_loss=train_loss,
@@ -592,6 +635,9 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
         "best_threshold":      best_thresh_entry["threshold"],
         "best_threshold_f1":   best_thresh_entry["f1"],
     }
+
+    if writer is not None:
+        writer.close()
 
     log_path = output_dir / "training_log.json"
     log_path.write_text(json.dumps(training_log, indent=2))
@@ -703,13 +749,15 @@ def _run_student_epoch(
     total = 0
 
     with torch.set_grad_enabled(train):
-        for keyword_vec, mfcc, hard_label, teacher_logit in loader:
-            keyword_vec = keyword_vec.to(device)    # [B, 64]
-            mfcc = mfcc.to(device)                  # [B, N_FRAMES, 13]
-            hard_label = hard_label.to(device)      # [B]
-            teacher_logit = teacher_logit.to(device) # [B]
+        for keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input in loader:
+            keyword_vec    = keyword_vec.to(device)     # [B, 128]
+            mfcc           = mfcc.to(device)            # [B, N_FRAMES, 13]
+            hard_label     = hard_label.to(device)      # [B]
+            teacher_logit  = teacher_logit.to(device)   # [B]
+            context_input  = context_input.to(device)   # [B, K_CONTEXT]
+            position_input = position_input.to(device)  # [B, 1]
 
-            student_logit = model(keyword_vec, mfcc).squeeze(-1)  # [B]
+            student_logit = model(keyword_vec, mfcc, context_input, position_input).squeeze(-1)  # [B]
 
             loss = kd_loss(
                 student_logit, teacher_logit, hard_label,
