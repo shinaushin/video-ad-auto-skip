@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from models import N_FRAMES, MFCC_DIM, TEXT_DIM, StudentModel, load_student
+from models import N_FRAMES, MFCC_DIM, TEXT_DIM, K_CONTEXT, StudentModel, load_student
 
 log = logging.getLogger(__name__)
 
@@ -61,25 +61,29 @@ def export(
     model.eval()
 
     # Dummy inputs — batch size 1.
-    dummy_text = torch.zeros(1, TEXT_DIM, dtype=torch.float32)    # [1, 64]
-    dummy_audio = torch.zeros(1, n_frames, MFCC_DIM, dtype=torch.float32)  # [1, 30, 13]
+    dummy_text     = torch.zeros(1, TEXT_DIM, dtype=torch.float32)         # [1, 128]
+    dummy_audio    = torch.zeros(1, n_frames, MFCC_DIM, dtype=torch.float32)  # [1, 30, 13]
+    dummy_context  = torch.full((1, K_CONTEXT), 0.5, dtype=torch.float32)  # [1, 3]
+    dummy_position = torch.zeros(1, 1, dtype=torch.float32)                # [1, 1]
 
     # Verify the model runs on the dummy input.
     with torch.no_grad():
-        dummy_out = model(dummy_text, dummy_audio)
+        dummy_out = model(dummy_text, dummy_audio, dummy_context, dummy_position)
     assert dummy_out.shape == (1, 1), f"Expected [1,1] got {dummy_out.shape}"
     log.info("Model forward pass OK  (dummy output: %.4f)", float(dummy_out[0, 0]))
 
     torch.onnx.export(
         model,
-        (dummy_text, dummy_audio),
+        (dummy_text, dummy_audio, dummy_context, dummy_position),
         str(out_path),
-        input_names=["text_input", "audio_input"],
+        input_names=["text_input", "audio_input", "context_input", "position_input"],
         output_names=["output"],
         dynamic_axes={
-            "text_input":  {0: "batch"},
-            "audio_input": {0: "batch", 1: "n_frames"},
-            "output":      {0: "batch"},
+            "text_input":     {0: "batch"},
+            "audio_input":    {0: "batch", 1: "n_frames"},
+            "context_input":  {0: "batch"},
+            "position_input": {0: "batch"},
+            "output":         {0: "batch"},
         },
         opset_version=opset,
         do_constant_folding=True,
@@ -120,35 +124,54 @@ def validate(out_path: Path, n_frames: int = N_FRAMES) -> bool:
     log.info("  Inputs:  %s", [(i.name, i.shape, i.type) for i in inputs])
     log.info("  Outputs: %s", [(o.name, o.shape, o.type) for o in outputs])
 
+    # Base dummy inputs.
+    text_in     = np.zeros((1, TEXT_DIM), dtype=np.float32)
+    audio_in    = np.zeros((1, n_frames, MFCC_DIM), dtype=np.float32)
+    context_in  = np.full((1, K_CONTEXT), 0.5, dtype=np.float32)
+    position_in = np.zeros((1, 1), dtype=np.float32)
+
+    feed = {
+        "text_input": text_in, "audio_input": audio_in,
+        "context_input": context_in, "position_input": position_in,
+    }
+
     # Test 1: batch=1, n_frames=N_FRAMES (normal extension call).
-    text_in = np.zeros((1, TEXT_DIM), dtype=np.float32)
-    audio_in = np.zeros((1, n_frames, MFCC_DIM), dtype=np.float32)
-    result = sess.run(None, {"text_input": text_in, "audio_input": audio_in})
+    result = sess.run(None, feed)
     assert result[0].shape == (1, 1), f"Output shape mismatch: {result[0].shape}"
     score = float(result[0][0, 0])
     assert 0.0 <= score <= 1.0, f"Output out of [0,1]: {score}"
     log.info("  Test 1 (batch=1, n_frames=%d): output=%.4f  ✓", n_frames, score)
 
     # Test 2: batch=4 (bulk evaluation).
-    text_in4 = np.zeros((4, TEXT_DIM), dtype=np.float32)
-    audio_in4 = np.zeros((4, n_frames, MFCC_DIM), dtype=np.float32)
-    result4 = sess.run(None, {"text_input": text_in4, "audio_input": audio_in4})
+    feed4 = {
+        "text_input":     np.zeros((4, TEXT_DIM), dtype=np.float32),
+        "audio_input":    np.zeros((4, n_frames, MFCC_DIM), dtype=np.float32),
+        "context_input":  np.full((4, K_CONTEXT), 0.5, dtype=np.float32),
+        "position_input": np.zeros((4, 1), dtype=np.float32),
+    }
+    result4 = sess.run(None, feed4)
     assert result4[0].shape == (4, 1), f"Batch output shape mismatch: {result4[0].shape}"
     log.info("  Test 2 (batch=4): output shape=%s  ✓", result4[0].shape)
 
     # Test 3: dynamic n_frames (shorter buffer = 10 frames).
-    audio_short = np.zeros((1, 10, MFCC_DIM), dtype=np.float32)
-    result_short = sess.run(None, {"text_input": text_in, "audio_input": audio_short})
+    feed_short = dict(feed)
+    feed_short["audio_input"] = np.zeros((1, 10, MFCC_DIM), dtype=np.float32)
+    result_short = sess.run(None, feed_short)
     assert result_short[0].shape == (1, 1)
     log.info("  Test 3 (n_frames=10): output=%.4f  ✓", float(result_short[0][0, 0]))
 
-    # Test 4: strong sponsor signal — keyword "sponsored by" fires.
+    # Test 4: strong sponsor signal with context.
     text_sponsor = np.zeros((1, TEXT_DIM), dtype=np.float32)
-    text_sponsor[0, 0] = 1.0   # pattern 0 = "sponsored by" (group 0)
-    text_sponsor[0, 16] = 1.0  # pattern 16 = "use code" (group 1)
-    result_sponsor = sess.run(None, {"text_input": text_sponsor, "audio_input": audio_in})
+    text_sponsor[0, 0]  = 1.0   # "sponsored by"
+    text_sponsor[0, 16] = 1.0   # "use code"
+    ctx_high = np.full((1, K_CONTEXT), 0.9, dtype=np.float32)  # high prior context
+    feed_sponsor = {
+        "text_input": text_sponsor, "audio_input": audio_in,
+        "context_input": ctx_high, "position_input": np.array([[0.15]], dtype=np.float32),
+    }
+    result_sponsor = sess.run(None, feed_sponsor)
     score_sponsor = float(result_sponsor[0][0, 0])
-    log.info("  Test 4 (sponsor keywords): output=%.4f", score_sponsor)
+    log.info("  Test 4 (sponsor keywords + high context): output=%.4f", score_sponsor)
 
     log.info("Validation passed.")
     return True
@@ -168,10 +191,13 @@ def write_model_manifest(out_path: Path, n_frames: int = N_FRAMES) -> None:
     manifest = {
         "text_input_name": "text_input",
         "audio_input_name": "audio_input",
+        "context_input_name": "context_input",
+        "position_input_name": "position_input",
         "output_name": "output",
         "text_dim": TEXT_DIM,
         "mfcc_dim": MFCC_DIM,
         "n_frames": n_frames,
+        "context_k": K_CONTEXT,
         "output_sigmoid": True,  # model already applies sigmoid internally
     }
     manifest_path = out_path.parent / "model_manifest.json"
