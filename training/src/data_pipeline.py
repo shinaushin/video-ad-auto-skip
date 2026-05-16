@@ -119,18 +119,58 @@ _RAW_PATTERNS: list[tuple[str, int]] = [
     (r"\bplan\b", 3), (r"\baccount\b", 3),
     (r"\bwebsite\b", 3), (r"\bonline\b", 3),
     (r"\bdigital\b", 3), (r"\btech\b", 3),
+
+    # group 4 [64–79] — extended sponsor intro variants (weight 2)
+    (r"\bworking with\b", 4), (r"\bcollab(?:oration)?\s+with\b", 4),
+    (r"\bbrand\s+(?:deal|collab|partnership)\b", 4), (r"\bendors(?:ed|ement|es)\b", 4),
+    (r"\bgifted\s+by\b", 4), (r"\bsponsorship\b", 4),
+    (r"\bcommercial\s+(?:break|message)\b", 4), (r"\bword\s+from\s+(?:our|today'?s)?\s*sponsor\b", 4),
+    (r"\bmessage\s+from\s+(?:our|today'?s)\b", 4), (r"\bquick\s+(?:word|message|break)\s+from\b", 4),
+    (r"\bpaid\s+collaboration\b", 4), (r"\bthis\s+(?:post|video)\s+(?:is\s+)?(?:an?\s+)?ad\b", 4),
+    (r"\bproud\s+to\s+work\s+with\b", 4), (r"\bnew\s+sponsor\b", 4),
+    (r"\blong.?time\s+sponsor\b", 4), (r"\bofficial\s+partner\b", 4),
+
+    # group 5 [80–95] — extended CTA variants (weight 1)
+    (r"\bshop\s+now\b", 5), (r"\bbuy\s+now\b", 5),
+    (r"\border\s+(?:now|today)\b", 5), (r"\bget\s+yours?\b", 5),
+    (r"\bclaim\s+(?:your|the)\b", 5), (r"\bgrab\s+yours?\b", 5),
+    (r"\bfollow\s+(?:the\s+)?link\b", 5), (r"\bjoin\s+(?:now|today)\b", 5),
+    (r"\bregister\s+(?:now|today)\b", 5), (r"\bbook\s+(?:a\s+)?(?:demo|call|consultation)\b", 5),
+    (r"\bstart\s+(?:your\s+)?(?:free\s+)?trial\b", 5), (r"\bactivate\s+(?:your|the)\b", 5),
+    (r"\bunlock\s+(?:your|the)\b", 5), (r"\bexclusive\s+link\b", 5),
+    (r"\btap\s+(?:the\s+)?link\b", 5), (r"\bswipe\s+up\b", 5),
+
+    # group 6 [96–111] — extended offer language (weight 1)
+    (r"\bhalf\s+(?:off|price)\b", 6), (r"\bfree\s+shipping\b", 6),
+    (r"\bno\s+credit\s+card\s+(?:needed|required|necessary)\b", 6), (r"\brisk.?free\b", 6),
+    (r"\bat\s+no\s+(?:cost|charge|fee)\b", 6), (r"\bintroductory\s+(?:price|offer|rate)\b", 6),
+    (r"\bearly\s+(?:access|bird)\b", 6), (r"\blifetime\s+(?:deal|access|membership)\b", 6),
+    (r"\bfor\s+(?:just|only)\s+\$?\d", 6), (r"\bstarting\s+(?:at|from)\s+\$?\d", 6),
+    (r"\bper\s+(?:month|year|week)\b", 6), (r"\bfree\s+(?:forever|for\s+life)\b", 6),
+    (r"\b\d+.day\s+(?:free\s+)?trial\b", 6), (r"\bno\s+hidden\s+fees?\b", 6),
+    (r"\bguaranteed\b", 6), (r"\bbest\s+price\b", 6),
+
+    # group 7 [112–127] — specific product/service categories (weight 0.5)
+    (r"\bonline\s+course\b", 7), (r"\bmaster\s*class\b", 7),
+    (r"\bweb\s+hosting\b", 7), (r"\bdomain\s+name\b", 7),
+    (r"\bpassword\s+manager\b", 7), (r"\bantivirus\b", 7),
+    (r"\bcloud\s+storage\b", 7), (r"\bstreaming\s+(?:service|platform)\b", 7),
+    (r"\binvesting\s+(?:app|platform)\b", 7), (r"\bfitness\s+(?:app|tracker|plan)\b", 7),
+    (r"\bprotein\s+(?:powder|shake)\b", 7), (r"\bsleep\s+(?:app|tracker|aid)\b", 7),
+    (r"\bbusiness\s+(?:tool|software)\b", 7), (r"\be.?commerce\b", 7),
+    (r"\bsaas\b", 7), (r"\bfintech\b", 7),
 ]
 
-# Compile and pad to exactly 64 entries.
-for _pat, _grp in _RAW_PATTERNS[:64]:
+# Compile and pad to exactly 128 entries.
+for _pat, _grp in _RAW_PATTERNS[:128]:
     _KEYWORD_PATTERNS.append((re.compile(_pat, re.IGNORECASE), _grp))
-while len(_KEYWORD_PATTERNS) < 64:
-    _KEYWORD_PATTERNS.append((re.compile(r"(?!x)x"), 3))  # never-match filler
+while len(_KEYWORD_PATTERNS) < 128:
+    _KEYWORD_PATTERNS.append((re.compile(r"(?!x)x"), 7))  # never-match filler
 
 
 def keyword_vector(text: str) -> np.ndarray:
-    """Return a 64-dim float32 indicator vector (1.0 if pattern matched)."""
-    vec = np.zeros(64, dtype=np.float32)
+    """Return a 128-dim float32 indicator vector (1.0 if pattern matched)."""
+    vec = np.zeros(128, dtype=np.float32)
     for i, (pat, _grp) in enumerate(_KEYWORD_PATTERNS):
         if pat.search(text):
             vec[i] = 1.0
@@ -886,8 +926,12 @@ class SponsorDataset:
                     oldest = next(iter(_cache))
                     del _cache[oldest]
             data = _cache[vid]
+            kw = data["text_keyword_vecs"][idx].astype(np.float32)
+            # Pad old 64-dim cache files to 128-dim (new dims fire as 0 for old videos).
+            if kw.shape[0] < 128:
+                kw = np.concatenate([kw, np.zeros(128 - kw.shape[0], dtype=np.float32)])
             yield {
-                "keyword_vec": data["text_keyword_vecs"][idx].astype(np.float32),
+                "keyword_vec": kw,
                 "audio_emb": data["audio_embs"][idx].astype(np.float32),
                 "text_emb": data["text_embs"][idx].astype(np.float32),
                 "label": int(data["labels"][idx]),
