@@ -4,11 +4,13 @@
  * Implements two feature extractors that feed the bimodal ML model:
  *
  *   KeywordFeatureExtractor
- *     Converts transcript text into a 64-dimensional binary indicator
+ *     Converts transcript text into a 128-dimensional binary indicator
  *     vector. Each dimension flags whether a specific keyword or phrase
- *     pattern was present in the text. Four groups of 16 features cover:
+ *     pattern was present in the text. Eight groups of 16 features cover:
  *     sponsor intro language, call-to-action language, offer/discount
- *     language, and product/service endorsement language.
+ *     language, product/service endorsement language, and four extended
+ *     groups with additional sponsor, CTA, offer, and product-category
+ *     patterns.
  *
  *     This is the "text modality" described in the project plan. It is
  *     a distilled version of the DistilBERT [CLS] embedding used in the
@@ -34,17 +36,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Converts text into a 64-dim binary keyword indicator vector.
+ * Converts text into a 128-dim binary keyword indicator vector.
  *
  * Feature groups:
- *   [0–15]   Sponsor intro phrases  (high precision, 3× weight in scoring)
- *   [16–31]  Call-to-action language (1.5× weight)
- *   [32–47]  Offer / discount language (1.5× weight)
- *   [48–63]  Product / service endorsement (0.5× weight — corroborating)
+ *   [0–15]    Sponsor intro phrases        (3× weight in scoring)
+ *   [16–31]   Call-to-action language      (1.5× weight)
+ *   [32–47]   Offer / discount language    (1.5× weight)
+ *   [48–63]   Product / service endorsement (0.5× weight)
+ *   [64–79]   Extended sponsor intro variants (2× weight)
+ *   [80–95]   Extended CTA variants        (1× weight)
+ *   [96–111]  Extended offer language      (1× weight)
+ *   [112–127] Specific product categories  (0.5× weight)
  */
 class KeywordFeatureExtractor {
 
-  static FEATURE_DIM = 64;
+  static FEATURE_DIM = 128;
 
   // Each entry is a RegExp. Index in the array === feature dimension index.
   static VOCAB = [
@@ -103,22 +109,94 @@ class KeywordFeatureExtractor {
     /\bsave \$?\d/i,
 
     // ── Group 3: Product / service endorsement [48–63] ────────────────────
-    /\bvpn\b/i,
-    /\bmeal (?:kit|prep|delivery)\b/i,
-    /\bskin ?care\b/i,
-    /\bsupplement\b/i,
     /\bapp\b/i,
-    /\bsubscription\b/i,
-    /\bpremium\b/i,
-    /\bnootropic\b/i,
-    /\bprotein\b/i,
-    /\bshaker\b/i,
     /\bplatform\b/i,
-    /\bsoftware\b/i,
-    /\btools?\b/i,
     /\bservice\b/i,
+    /\bsoftware\b/i,
     /\bproduct\b/i,
-    /\bbrand\b/i,
+    /\bsubscription\b/i,
+    /\btool\b/i,
+    /\bsolution\b/i,
+    /\bpremium\b/i,
+    /\bpro\s+plan\b/i,
+    /\bplan\b/i,
+    /\baccount\b/i,
+    /\bwebsite\b/i,
+    /\bonline\b/i,
+    /\bdigital\b/i,
+    /\btech\b/i,
+
+    // ── Group 4: Extended sponsor intro variants [64–79] ──────────────────
+    /\bworking with\b/i,
+    /\bcollab(?:oration)?\s+with\b/i,
+    /\bbrand\s+(?:deal|collab|partnership)\b/i,
+    /\bendors(?:ed|ement|es)\b/i,
+    /\bgifted\s+by\b/i,
+    /\bsponsorship\b/i,
+    /\bcommercial\s+(?:break|message)\b/i,
+    /\bword\s+from\s+(?:our|today'?s)?\s*sponsor\b/i,
+    /\bmessage\s+from\s+(?:our|today'?s)\b/i,
+    /\bquick\s+(?:word|message|break)\s+from\b/i,
+    /\bpaid\s+collaboration\b/i,
+    /\bthis\s+(?:post|video)\s+(?:is\s+)?(?:an?\s+)?ad\b/i,
+    /\bproud\s+to\s+work\s+with\b/i,
+    /\bnew\s+sponsor\b/i,
+    /\blong.?time\s+sponsor\b/i,
+    /\bofficial\s+partner\b/i,
+
+    // ── Group 5: Extended CTA variants [80–95] ────────────────────────────
+    /\bshop\s+now\b/i,
+    /\bbuy\s+now\b/i,
+    /\border\s+(?:now|today)\b/i,
+    /\bget\s+yours?\b/i,
+    /\bclaim\s+(?:your|the)\b/i,
+    /\bgrab\s+yours?\b/i,
+    /\bfollow\s+(?:the\s+)?link\b/i,
+    /\bjoin\s+(?:now|today)\b/i,
+    /\bregister\s+(?:now|today)\b/i,
+    /\bbook\s+(?:a\s+)?(?:demo|call|consultation)\b/i,
+    /\bstart\s+(?:your\s+)?(?:free\s+)?trial\b/i,
+    /\bactivate\s+(?:your|the)\b/i,
+    /\bunlock\s+(?:your|the)\b/i,
+    /\bexclusive\s+link\b/i,
+    /\btap\s+(?:the\s+)?link\b/i,
+    /\bswipe\s+up\b/i,
+
+    // ── Group 6: Extended offer language [96–111] ─────────────────────────
+    /\bhalf\s+(?:off|price)\b/i,
+    /\bfree\s+shipping\b/i,
+    /\bno\s+credit\s+card\s+(?:needed|required|necessary)\b/i,
+    /\brisk.?free\b/i,
+    /\bat\s+no\s+(?:cost|charge|fee)\b/i,
+    /\bintroductory\s+(?:price|offer|rate)\b/i,
+    /\bearly\s+(?:access|bird)\b/i,
+    /\blifetime\s+(?:deal|access|membership)\b/i,
+    /\bfor\s+(?:just|only)\s+\$?\d/i,
+    /\bstarting\s+(?:at|from)\s+\$?\d/i,
+    /\bper\s+(?:month|year|week)\b/i,
+    /\bfree\s+(?:forever|for\s+life)\b/i,
+    /\b\d+.day\s+(?:free\s+)?trial\b/i,
+    /\bno\s+hidden\s+fees?\b/i,
+    /\bguaranteed\b/i,
+    /\bbest\s+price\b/i,
+
+    // ── Group 7: Specific product / service categories [112–127] ─────────
+    /\bonline\s+course\b/i,
+    /\bmaster\s*class\b/i,
+    /\bweb\s+hosting\b/i,
+    /\bdomain\s+name\b/i,
+    /\bpassword\s+manager\b/i,
+    /\bantivirus\b/i,
+    /\bcloud\s+storage\b/i,
+    /\bstreaming\s+(?:service|platform)\b/i,
+    /\binvesting\s+(?:app|platform)\b/i,
+    /\bfitness\s+(?:app|tracker|plan)\b/i,
+    /\bprotein\s+(?:powder|shake)\b/i,
+    /\bsleep\s+(?:app|tracker|aid)\b/i,
+    /\bbusiness\s+(?:tool|software)\b/i,
+    /\be.?commerce\b/i,
+    /\bsaas\b/i,
+    /\bfintech\b/i,
   ];
 
   /**
@@ -167,9 +245,12 @@ class KeywordFeatureExtractor {
    */
   static keywordScore(features) {
     let score = 0;
-    for (let i = 0;  i < 16; i++) score += features[i] * 3.0;
-    for (let i = 16; i < 48; i++) score += features[i] * 1.5;
-    for (let i = 48; i < 64; i++) score += features[i] * 0.5;
+    for (let i = 0;   i < 16;  i++) score += features[i] * 3.0;  // intro phrases
+    for (let i = 16;  i < 48;  i++) score += features[i] * 1.5;  // CTA + offers
+    for (let i = 48;  i < 64;  i++) score += features[i] * 0.5;  // product language
+    for (let i = 64;  i < 80;  i++) score += features[i] * 2.0;  // extended intro
+    for (let i = 80;  i < 112; i++) score += features[i] * 1.0;  // extended CTA + offers
+    for (let i = 112; i < 128; i++) score += features[i] * 0.5;  // product categories
     return score;
   }
 }
