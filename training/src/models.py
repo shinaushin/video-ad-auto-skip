@@ -8,14 +8,17 @@ Teacher (used on Kaggle for training):
     Linear(768→1) classifier (sigmoid output)
 
 Student (ships in the Chrome extension via ONNX Runtime Web):
-    Text branch  : Linear(64→32)                            (keyword indicator vector input)
+    Text branch  : Linear(128→32)                           (keyword indicator vector input)
     Audio branch : Conv1d(1, 32, k=3) → ReLU → Conv1d(32, 64, k=3) → ReLU → AdaptiveAvgPool1d(1)
                    → Linear(64→32)                          (MFCC frame sequence input)
-    Fusion MLP   : Linear(64→32) → ReLU → Linear(32→16) → ReLU → Linear(16→1) (sigmoid)
+    Fusion MLP   : Linear(68→32) → ReLU → Linear(32→16) → ReLU → Linear(16→1) (sigmoid)
+                   (68 = 32 text + 32 audio + 3 context + 1 position)
 
 Input shapes (student ONNX):
-    text_input   float32 [batch, 64]
-    audio_input  float32 [batch, N_FRAMES, 13]   (N_FRAMES = 30, MFCC channels = 13)
+    text_input      float32 [batch, 128]              keyword indicator vector
+    audio_input     float32 [batch, N_FRAMES, 13]     MFCC frame sequence (N_FRAMES=30)
+    context_input   float32 [batch, K_CONTEXT]        last K sigmoid outputs (K=3)
+    position_input  float32 [batch, 1]                relative window position in video [0, 1]
 
 Output:
     float32 [batch, 1]   (sigmoid probability — sponsor confidence)
@@ -34,13 +37,16 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 #: Keyword indicator vector dimension (must match feature-extractor.js).
-TEXT_DIM = 64
+TEXT_DIM = 128
 
 #: MFCC coefficient dimension per frame.
 MFCC_DIM = 13
 
 #: Number of buffered MFCC frames for the CNN (must match N_MFCC_FRAMES in extension).
 N_FRAMES = 30
+
+#: Number of previous window predictions fed as context to the student fusion MLP.
+K_CONTEXT = 3
 
 #: DistilBERT hidden size.
 DISTILBERT_DIM = 768
@@ -103,10 +109,25 @@ class TeacherModel(nn.Module):
         lstm_hidden: int = 192,
         lstm_layers: int = 2,
         dropout: float = 0.1,
+        embed_mode: str = "both",
     ) -> None:
+        """
+        Args:
+            embed_mode: Which modalities to use.
+                "both"       — cross-attention fusion of text + audio (default).
+                "text_only"  — text projection → BiLSTM; audio branch unused.
+                "audio_only" — audio projection → BiLSTM; text branch unused.
+        """
         super().__init__()
 
+        assert embed_mode in ("both", "text_only", "audio_only"), (
+            f"embed_mode must be 'both', 'text_only', or 'audio_only'; got {embed_mode!r}"
+        )
+        self.embed_mode = embed_mode
+
         # Project both modalities to the same dimension.
+        # (Both projections are always instantiated so checkpoints stay compatible
+        #  regardless of mode; unused branches are simply not called at forward time.)
         self.text_proj = nn.Sequential(
             nn.Linear(distilbert_dim, proj_dim),
             nn.LayerNorm(proj_dim),
@@ -118,7 +139,7 @@ class TeacherModel(nn.Module):
             nn.ReLU(),
         )
 
-        # Cross-attention fusion (text attends to audio).
+        # Cross-attention fusion (text attends to audio) — only used in "both" mode.
         self.cross_attn = CrossAttentionFusion(dim=proj_dim, n_heads=4)
 
         # BiLSTM for temporal context over the window sequence.
@@ -147,15 +168,21 @@ class TeacherModel(nn.Module):
     ) -> torch.Tensor:
         batch, seq_len, _ = text_embs.shape
 
-        # Project modalities.  [batch, seq_len, proj_dim]
-        t = self.text_proj(text_embs)
-        a = self.audio_proj(audio_embs)
-
-        # Apply cross-attention per window (reshape to [batch*seq, 1, proj_dim]).
-        t_flat = t.view(batch * seq_len, 1, -1)
-        a_flat = a.view(batch * seq_len, 1, -1)
-        fused_flat = self.cross_attn(t_flat, a_flat)           # [batch*seq, 1, proj_dim]
-        fused = fused_flat.view(batch, seq_len, -1)            # [batch, seq_len, proj_dim]
+        if self.embed_mode == "text_only":
+            # Project text directly; skip audio and cross-attention.
+            fused = self.text_proj(text_embs)                  # [batch, seq_len, proj_dim]
+        elif self.embed_mode == "audio_only":
+            # Project audio directly; skip text and cross-attention.
+            fused = self.audio_proj(audio_embs)                # [batch, seq_len, proj_dim]
+        else:
+            # "both": project both modalities then fuse via cross-attention.
+            t = self.text_proj(text_embs)                      # [batch, seq_len, proj_dim]
+            a = self.audio_proj(audio_embs)                    # [batch, seq_len, proj_dim]
+            # Apply cross-attention per window (reshape to [batch*seq, 1, proj_dim]).
+            t_flat = t.view(batch * seq_len, 1, -1)
+            a_flat = a.view(batch * seq_len, 1, -1)
+            fused_flat = self.cross_attn(t_flat, a_flat)       # [batch*seq, 1, proj_dim]
+            fused = fused_flat.view(batch, seq_len, -1)        # [batch, seq_len, proj_dim]
 
         # BiLSTM temporal modelling.
         if lengths is not None:
@@ -266,9 +293,11 @@ class StudentModel(nn.Module):
         super().__init__()
         self.text_branch = KeywordTextBranch(TEXT_DIM, 32)
         self.audio_branch = MFCCConvBranch(MFCC_DIM, 32)
+        # Fusion MLP input: 32 (text) + 32 (audio) + K_CONTEXT (context) + 1 (position) = 68
+        fusion_in = 32 + 32 + K_CONTEXT + 1
         self.fusion = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(64, 32),
+            nn.Linear(fusion_in, 32),
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
@@ -279,33 +308,47 @@ class StudentModel(nn.Module):
         self,
         text_input: torch.Tensor,
         audio_input: torch.Tensor,
+        context_input: torch.Tensor,
+        position_input: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            text_input:   [batch, 64]
-            audio_input:  [batch, N_FRAMES, 13]
+            text_input:     [batch, TEXT_DIM]         keyword indicator vector
+            audio_input:    [batch, N_FRAMES, MFCC_DIM]
+            context_input:  [batch, K_CONTEXT]        last K sigmoid predictions
+            position_input: [batch, 1]                relative window position [0, 1]
 
         Returns:
             logits [batch, 1]
         """
-        text_feat = self.text_branch(text_input)    # [batch, 32]
-        audio_feat = self.audio_branch(audio_input) # [batch, 32]
-        combined = torch.cat([text_feat, audio_feat], dim=-1)  # [batch, 64]
-        return self.fusion(combined)                # [batch, 1]
+        text_feat  = self.text_branch(text_input)    # [batch, 32]
+        audio_feat = self.audio_branch(audio_input)  # [batch, 32]
+        combined   = torch.cat(
+            [text_feat, audio_feat, context_input, position_input], dim=-1
+        )                                            # [batch, 68]
+        return self.fusion(combined)                 # [batch, 1]
 
     def predict_proba(
         self,
         text_input: torch.Tensor,
         audio_input: torch.Tensor,
+        context_input: torch.Tensor,
+        position_input: torch.Tensor,
     ) -> torch.Tensor:
         """Return sigmoid probabilities [batch, 1]."""
-        return torch.sigmoid(self.forward(text_input, audio_input))
+        return torch.sigmoid(self.forward(text_input, audio_input, context_input, position_input))
 
     @torch.no_grad()
-    def score(self, text_input: torch.Tensor, audio_input: torch.Tensor) -> float:
+    def score(
+        self,
+        text_input: torch.Tensor,
+        audio_input: torch.Tensor,
+        context_input: torch.Tensor,
+        position_input: torch.Tensor,
+    ) -> float:
         """Return a single float confidence score (convenience wrapper)."""
-        return float(self.predict_proba(text_input, audio_input).squeeze())
+        return float(self.predict_proba(text_input, audio_input, context_input, position_input).squeeze())
 
 
 # ---------------------------------------------------------------------------
@@ -377,9 +420,11 @@ if __name__ == "__main__":
 
     # Student
     student = build_student(device=device).train()
-    text_in = torch.randn(B, TEXT_DIM).to(device)
-    audio_in = torch.randn(B, N_FRAMES, MFCC_DIM).to(device)
-    logits_s = student(text_in, audio_in)
+    text_in     = torch.randn(B, TEXT_DIM).to(device)
+    audio_in    = torch.randn(B, N_FRAMES, MFCC_DIM).to(device)
+    context_in  = torch.zeros(B, K_CONTEXT).to(device)
+    position_in = torch.rand(B, 1).to(device)
+    logits_s = student(text_in, audio_in, context_in, position_in)
     print(f"Student output: {logits_s.shape}")  # [2, 1]
     assert logits_s.shape == (B, 1), "Student shape mismatch"
 
