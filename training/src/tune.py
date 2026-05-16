@@ -53,6 +53,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 try:
+    from torch.utils.tensorboard import SummaryWriter
+    _HAS_TB = True
+except ImportError:
+    _HAS_TB = False
+
+try:
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 except ImportError as exc:
@@ -89,29 +95,39 @@ def objective(
     tune_epochs: int,
     tune_patience: int,
     reporter: Optional["MetricsReporter"] = None,
+    tb_dir: Optional[str] = None,
+    gcs_output: Optional[str] = None,
+    embed_mode: str = "both",
 ) -> float:
     """Train a teacher model with trial-suggested hyperparameters; return best val_f1."""
 
     # ── Hyperparameter suggestions ─────────────────────────────────────────
-    lr              = trial.suggest_float("lr",              5e-5, 2e-3,  log=True)
-    weight_decay    = trial.suggest_float("weight_decay",    1e-5, 1e-2,  log=True)
-    dropout         = trial.suggest_float("dropout",         0.0,  0.25)
-    lstm_hidden     = trial.suggest_categorical("lstm_hidden", [96, 128, 192, 256])
-    seq_batch_size  = trial.suggest_categorical("seq_batch_size", [4, 8, 16])
-    # pos_weight_mult removed — class imbalance is handled by WeightedRandomSampler;
-    # tuning pos_weight on top double-corrects and causes sponsor over-prediction.
+    # Fixed params from best trial of previous run.
+    lr             = 5.39e-05
+    weight_decay   = 8.12e-03
+    dropout        = 0.21
+    lstm_hidden    = 256
+    seq_batch_size = 4
+
+    # Active search: depth and class-imbalance correction.
+    lstm_layers     = trial.suggest_categorical("lstm_layers", [1, 2, 3])
+    # pos_weight multiplier on top of WeightedRandomSampler — kept modest (1-4x)
+    # to nudge recall without causing severe sponsor over-prediction.
+    pos_weight_mult = trial.suggest_float("pos_weight_mult", 1.0, 4.0)
 
     log.info(
-        "Trial %d | lr=%.2e wd=%.2e drop=%.2f lstm=%d batch=%d",
-        trial.number, lr, weight_decay, dropout, lstm_hidden, seq_batch_size,
+        "Trial %d | lr=%.2e wd=%.2e drop=%.2f lstm_h=%d lstm_l=%d batch=%d pw=%.2f",
+        trial.number, lr, weight_decay, dropout, lstm_hidden, lstm_layers,
+        seq_batch_size, pos_weight_mult,
     )
 
     # ── Build model with trial architecture ───────────────────────────────
-    model     = TeacherModel(lstm_hidden=lstm_hidden, dropout=dropout).to(device)
+    model     = TeacherModel(lstm_hidden=lstm_hidden, lstm_layers=lstm_layers, dropout=dropout, embed_mode=embed_mode).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
-    # Neutral pos_weight — WeightedRandomSampler above handles class imbalance.
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([pos_weight_mult], device=device)
+    )
 
     # Rebuild loaders each trial (batch size may vary between trials).
     train_has_sponsor = [
@@ -126,6 +142,11 @@ def objective(
         val_ds, batch_size=seq_batch_size, shuffle=False,
         collate_fn=collate_teacher_sequences, num_workers=0,
     )
+
+    # ── TensorBoard writer (one sub-run per trial) ────────────────────────
+    writer = None
+    if _HAS_TB and tb_dir:
+        writer = SummaryWriter(log_dir=f"{tb_dir}/trial_{trial.number:03d}")
 
     # ── Short training loop with Optuna pruning ───────────────────────────
     best_val_f1 = 0.0
@@ -149,12 +170,24 @@ def objective(
             val_f1, val_m["precision"], val_m["recall"], val_m["mean_prob_pos"], elapsed,
         )
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # ── TensorBoard ───────────────────────────────────────────────────
+        if writer is not None:
+            writer.add_scalar("val/f1",        val_f1,                    epoch)
+            writer.add_scalar("val/loss",      val_loss,                  epoch)
+            writer.add_scalar("val/precision", val_m.get("precision", 0), epoch)
+            writer.add_scalar("val/recall",    val_m.get("recall", 0),    epoch)
+            writer.add_scalar("lr",            current_lr,                epoch)
+            writer.flush()
+            if gcs_output and _HAS_GCP_UTILS:
+                upload_to_gcs(tb_dir, f"{gcs_output}/tb")
+
         # ── Cloud Monitoring ──────────────────────────────────────────────
         if reporter is not None:
-            current_lr = optimizer.param_groups[0]["lr"]
             reporter.emit_epoch(
                 epoch,
-                train_loss=0.0,   # train_loss not returned by _run_teacher_epoch in tune
+                train_loss=0.0,
                 val_loss=val_loss,
                 val_f1=val_f1,
                 val_precision=val_m.get("precision", 0.0),
@@ -182,6 +215,23 @@ def objective(
                 break
 
     log.info("  Trial %d finished | best_val_f1=%.4f", trial.number, best_val_f1)
+
+    if writer is not None:
+        writer.add_hparams(
+            {
+                "lr":             lr,
+                "weight_decay":   weight_decay,
+                "dropout":        dropout,
+                "lstm_hidden":    lstm_hidden,
+                "lstm_layers":    lstm_layers,
+                "seq_batch_size": seq_batch_size,
+                "pos_weight_mult": pos_weight_mult,
+                "embed_mode":     embed_mode,
+            },
+            {"hparam/best_val_f1": best_val_f1},
+        )
+        writer.close()
+
     return best_val_f1
 
 
@@ -190,7 +240,7 @@ def objective(
 # ---------------------------------------------------------------------------
 
 
-def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None) -> Path:
+def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None, gcs_output: Optional[str] = None, embed_mode: str = "both") -> Path:
     """Run the Optuna study and save results to output_dir."""
     cache_dir   = Path(cfg["cache_dir"])
     output_dir  = Path(cfg["output_dir"])
@@ -229,7 +279,7 @@ def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = Non
         direction="maximize",
         sampler=sampler,
         pruner=pruner,
-        study_name="teacher-hparam-search",
+        study_name=f"teacher-hparam-search-{embed_mode}",
         storage=f"sqlite:///{db_path}",
         load_if_exists=True,   # resume if kernel is interrupted and restarted
     )
@@ -239,10 +289,17 @@ def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = Non
         n_trials, tune_epochs, tune_patience,
     )
 
+    tb_dir = str(output_dir / "tb") if _HAS_TB else None
+    if tb_dir:
+        log.info("TensorBoard logs → %s", tb_dir)
+
     study.optimize(
         lambda trial: objective(
             trial, train_ds, val_ds, device, tune_epochs, tune_patience,
             reporter=reporter,
+            tb_dir=tb_dir,
+            gcs_output=gcs_output,
+            embed_mode=embed_mode,
         ),
         n_trials=n_trials,
         catch=(RuntimeError, ValueError),  # log exceptions, don't abort the study
@@ -335,6 +392,9 @@ def main() -> None:
                    help="Local directory for downloaded embeddings cache.")
     p.add_argument("--gcs-output", type=str, default=None,
                    help="GCS URI to upload output dir after tuning (gs://bucket/outputs/run).")
+    p.add_argument("--embed-mode", type=str, default="both",
+                   choices=["both", "text_only", "audio_only"],
+                   help="Which embedding modalities to use: 'both' (default), 'text_only', or 'audio_only'.")
     # Resumability: download/upload the Optuna SQLite DB from/to GCS.
     p.add_argument("--gcs-study-db", type=str, default=None,
                    help="GCS URI of the Optuna SQLite study DB for cross-job resumability "
@@ -394,7 +454,7 @@ def main() -> None:
         reporter = MetricsReporter(phase="tune", job_name=args.job_name)
 
     # ── Run tuning ─────────────────────────────────────────────────────────
-    run_tune(cfg, device, reporter=reporter)
+    run_tune(cfg, device, reporter=reporter, gcs_output=gcs_output, embed_mode=args.embed_mode)
 
     # ── GCS output: upload results + study DB ─────────────────────────────
     if _HAS_GCP_UTILS:
