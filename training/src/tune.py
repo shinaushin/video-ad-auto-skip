@@ -21,13 +21,16 @@ Config keys (JSON):
     device          str   "cuda" | "cpu" | "auto"
     seed            int   (default 42)
 
-Search space:
-    lr               log-uniform [5e-5, 2e-3]
-    weight_decay     log-uniform [1e-5, 1e-2]
-    dropout          uniform     [0.0, 0.25]
-    lstm_hidden      categorical [96, 128, 192, 256]
-    seq_batch_size   categorical [4, 8, 16]
-    (pos_weight_mult removed — class imbalance handled by WeightedRandomSampler only)
+Fixed params (not modality-sensitive, from `both` best trials):
+    weight_decay    = 8.12e-03  (phase 1 best)
+    dropout         = 0.21      (phase 1 best)
+    lstm_hidden     = 256       (phase 1 best)
+    lstm_layers     = 2         (phase 2 best — trial 4)
+    seq_batch_size  = 4         (phase 1 best)
+
+Active search (modality-sensitive — each embed_mode gets its own best values):
+    lr              log-uniform [1e-5, 5e-4]
+    pos_weight_mult uniform     [1.0, 6.0]
 
 Outputs (written to config["output_dir"]):
     tune_results.json      All trial results with params + val_f1
@@ -102,18 +105,18 @@ def objective(
     """Train a teacher model with trial-suggested hyperparameters; return best val_f1."""
 
     # ── Hyperparameter suggestions ─────────────────────────────────────────
-    # Fixed params from best trial of previous run.
-    lr             = 5.39e-05
+    # Structural params fixed from best `both` trial — not modality-sensitive.
     weight_decay   = 8.12e-03
     dropout        = 0.21
     lstm_hidden    = 256
+    lstm_layers    = 2
     seq_batch_size = 4
 
-    # Active search: depth and class-imbalance correction.
-    lstm_layers     = trial.suggest_categorical("lstm_layers", [1, 2, 3])
-    # pos_weight multiplier on top of WeightedRandomSampler — kept modest (1-4x)
-    # to nudge recall without causing severe sponsor over-prediction.
-    pos_weight_mult = trial.suggest_float("pos_weight_mult", 1.0, 4.0)
+    # Active search: lr and pos_weight_mult are modality-sensitive.
+    # `both` best values were lr=5.39e-05, pw=1.87 — other modalities may
+    # need a higher lr to escape class collapse and a different pw.
+    lr              = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
+    pos_weight_mult = trial.suggest_float("pos_weight_mult", 1.0, 6.0)
 
     log.info(
         "Trial %d | lr=%.2e wd=%.2e drop=%.2f lstm_h=%d lstm_l=%d batch=%d pw=%.2f",
@@ -258,8 +261,12 @@ def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = Non
         len(train_ids), len(val_ids), n_trials,
     )
 
-    train_ds = TeacherSequenceDataset(SponsorDataset(cache_dir, train_ids, require_audio=False))
-    val_ds   = TeacherSequenceDataset(SponsorDataset(cache_dir, val_ids, require_audio=False))
+    min_votes = int(cfg.get("min_votes", 0))
+    if min_votes > 0:
+        log.info("Applying min_votes=%d label filter at training time", min_votes)
+
+    train_ds = TeacherSequenceDataset(SponsorDataset(cache_dir, train_ids, require_audio=False, min_votes=min_votes))
+    val_ds   = TeacherSequenceDataset(SponsorDataset(cache_dir, val_ids, require_audio=False, min_votes=min_votes))
 
     n_pos = sum(w["label"] for seq in train_ds._sequences for w in seq)
     n_neg = sum(1 - w["label"] for seq in train_ds._sequences for w in seq)
@@ -404,6 +411,11 @@ def main() -> None:
                    help="Attach a Cloud Logging handler to the root logger.")
     p.add_argument("--job-name", type=str, default="yt-sponsor-tune",
                    help="Display name for Cloud Logging and Monitoring labels.")
+    p.add_argument("--min-votes", type=int, default=None,
+                   help="Minimum SponsorBlock community votes to trust a sponsor segment. "
+                        "If the npz cache contains sponsor_segs/sponsor_seg_votes arrays, "
+                        "window labels are recomputed at load time using this threshold. "
+                        "Run backfill_votes.py first if your cache pre-dates this feature.")
     args = p.parse_args()
 
     # ── Cloud Logging ──────────────────────────────────────────────────────
@@ -415,6 +427,11 @@ def main() -> None:
         cfg = load_config(args.config)
     else:
         cfg = json.loads(Path(args.config).read_text())
+
+    if args.min_votes is not None:
+        cfg["min_votes"] = args.min_votes
+    log.info("min_votes=%s (label quality filter; 0 = use stored labels as-is)",
+             cfg.get("min_votes", 0))
 
     # ── GCS input: download embeddings ────────────────────────────────────
     gcs_output = args.gcs_output or os.environ.get("AIP_MODEL_DIR", "")

@@ -442,7 +442,7 @@ def _eval_teacher_with_thresholds(
     return total_loss / n, metrics, curve
 
 
-def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None) -> Path:
+def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None, gcs_output: Optional[str] = None) -> Path:
     """Train the teacher model and return the checkpoint path."""
     cache_dir = Path(cfg["cache_dir"])
     output_dir = Path(cfg["output_dir"])
@@ -459,8 +459,12 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
     log.info("Split: %d train / %d val / %d test videos",
              len(train_ids), len(val_ids), len(test_ids))
 
-    train_ds = TeacherSequenceDataset(SponsorDataset(cache_dir, train_ids, require_audio=False))
-    val_ds   = TeacherSequenceDataset(SponsorDataset(cache_dir, val_ids, require_audio=False))
+    min_votes = int(cfg.get("min_votes", 0))
+    if min_votes > 0:
+        log.info("Applying min_votes=%d label filter at training time", min_votes)
+
+    train_ds = TeacherSequenceDataset(SponsorDataset(cache_dir, train_ids, require_audio=False, min_votes=min_votes))
+    val_ds   = TeacherSequenceDataset(SponsorDataset(cache_dir, val_ids, require_audio=False, min_votes=min_votes))
 
     # Log class counts for reference (no pos_weight — WeightedRandomSampler handles
     # class imbalance at the batch level; adding pos_weight on top double-corrects
@@ -488,14 +492,17 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
 
     # Allow Optuna best_params.json to be pasted directly into the config.
     lstm_hidden = int(cfg.get("lstm_hidden", 192))
+    lstm_layers = int(cfg.get("lstm_layers", 1))
     dropout     = float(cfg.get("dropout", 0.1))
-    model       = TeacherModel(lstm_hidden=lstm_hidden, dropout=dropout).to(device)
+    embed_mode  = cfg.get("embed_mode", "both")
+    model       = TeacherModel(lstm_hidden=lstm_hidden, lstm_layers=lstm_layers,
+                               dropout=dropout, embed_mode=embed_mode).to(device)
     optimizer   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
-    # BCEWithLogitsLoss with neutral pos_weight — class imbalance is handled
-    # entirely by WeightedRandomSampler above.  Using pos_weight on top of the
-    # sampler double-corrects and drives the model to over-predict sponsor.
-    criterion = nn.BCEWithLogitsLoss()
+    pos_weight_mult = float(cfg.get("pos_weight_mult", 1.0))
+    criterion = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([pos_weight_mult], device=device)
+    )
 
     best_val_f1      = -1.0   # track F1; higher = better (prevents collapse to all-zero)
     best_val_loss    = float("inf")  # kept for logging only
@@ -503,6 +510,7 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
     best_ckpt        = output_dir / "teacher_best.pt"
 
     writer = None
+    tb_dir = None
     if _HAS_TB:
         tb_dir = output_dir / "tb"
         writer = SummaryWriter(log_dir=str(tb_dir))
@@ -565,6 +573,9 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
             writer.add_scalar("val/precision", val_m.get("precision", 0), epoch)
             writer.add_scalar("val/recall",    val_m.get("recall", 0),    epoch)
             writer.add_scalar("lr",            current_lr,                epoch)
+            writer.flush()
+            if gcs_output and _HAS_GCP_UTILS and tb_dir is not None:
+                upload_to_gcs(str(tb_dir), f"{gcs_output}/tb")
 
         # ── Cloud Monitoring ──────────────────────────────────────────────
         if reporter is not None:
@@ -608,7 +619,7 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
     state = torch.load(best_ckpt, map_location=device)
     model.load_state_dict(state["model_state_dict"])
 
-    test_ds     = TeacherSequenceDataset(SponsorDataset(cache_dir, test_ids, require_audio=False))
+    test_ds     = TeacherSequenceDataset(SponsorDataset(cache_dir, test_ids, require_audio=False, min_votes=min_votes))
     test_loader = DataLoader(
         test_ds, batch_size=seq_batch, shuffle=False,
         collate_fn=collate_teacher_sequences, num_workers=0,
@@ -799,13 +810,17 @@ def train_distill(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
 
     train_ids, val_ids, test_ids = SponsorDataset.train_val_test_split(cache_dir)
 
+    min_votes = int(cfg.get("min_votes", 0))
+    if min_votes > 0:
+        log.info("Applying min_votes=%d label filter at training time", min_votes)
+
     # Collect teacher logits over train + val sets.
     teacher_logits: dict[tuple[str, int], float] = {}
     if teacher_ckpt:
         log.info("Loading teacher for logit collection: %s", teacher_ckpt)
         teacher = load_teacher(teacher_ckpt, device=device)
         for split_ids in (train_ids, val_ids):
-            split_ds = SponsorDataset(cache_dir, split_ids, require_audio=False)
+            split_ds = SponsorDataset(cache_dir, split_ids, require_audio=False, min_votes=min_votes)
             teacher_logits.update(collect_teacher_logits(teacher, split_ds, device))
         del teacher
         if device == "cuda":
@@ -814,8 +829,8 @@ def train_distill(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
         log.warning("No teacher checkpoint provided — using hard labels only (alpha→0)")
         kd_alpha = 0.0
 
-    train_ds = StudentWindowDataset(SponsorDataset(cache_dir, train_ids, require_audio=False), teacher_logits)
-    val_ds = StudentWindowDataset(SponsorDataset(cache_dir, val_ids, require_audio=False), teacher_logits)
+    train_ds = StudentWindowDataset(SponsorDataset(cache_dir, train_ids, require_audio=False, min_votes=min_votes), teacher_logits)
+    val_ds = StudentWindowDataset(SponsorDataset(cache_dir, val_ids, require_audio=False, min_votes=min_votes), teacher_logits)
 
     train_labels = [int(d[2].item()) for d in train_ds]
     sampler = make_balanced_sampler(train_labels)
@@ -983,6 +998,14 @@ def main() -> None:
                    help="Attach a Cloud Logging handler to the root logger.")
     p.add_argument("--job-name", type=str, default="yt-sponsor-train",
                    help="Display name for Cloud Logging log and Monitoring labels.")
+    p.add_argument("--embed-mode", type=str, default=None,
+                   choices=["both", "text_only", "audio_only"],
+                   help="Embedding modality (overrides config value if set).")
+    p.add_argument("--min-votes", type=int, default=None,
+                   help="Minimum SponsorBlock community votes to trust a sponsor segment. "
+                        "If the npz cache contains sponsor_segs/sponsor_seg_votes arrays, "
+                        "window labels are recomputed at load time using this threshold. "
+                        "Run backfill_votes.py first if your cache pre-dates this feature.")
     args = p.parse_args()
 
     # ── Cloud Logging ──────────────────────────────────────────────────────
@@ -994,6 +1017,14 @@ def main() -> None:
         cfg = load_config(args.config)
     else:
         cfg = json.loads(Path(args.config).read_text())
+
+    # CLI overrides for embed_mode and min_votes.
+    if args.embed_mode is not None:
+        cfg["embed_mode"] = args.embed_mode
+    if args.min_votes is not None:
+        cfg["min_votes"] = args.min_votes
+    log.info("min_votes=%s (label quality filter; 0 = use stored labels as-is)",
+             cfg.get("min_votes", 0))
 
     phase = cfg.get("phase", "teacher")
 
@@ -1032,7 +1063,7 @@ def main() -> None:
 
     # ── Train ──────────────────────────────────────────────────────────────
     if phase == "teacher":
-        train_teacher(cfg, device, reporter=reporter)
+        train_teacher(cfg, device, reporter=reporter, gcs_output=gcs_output)
     elif phase == "distill":
         train_distill(cfg, device, reporter=reporter)
     elif phase == "baseline":
