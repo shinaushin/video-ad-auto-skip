@@ -14,12 +14,14 @@ Usage (standalone):
     python data_pipeline.py --csv sponsorTimes.csv --out cache/ --videos 300 --workers 4
 
 Output per video  <CACHE_DIR>/<videoId>.npz:
-    segments          float32 [N, 2]     sponsor segment start/end seconds
-    audio_embs        float32 [N, 384]   Whisper mean-pooled encoder embeddings
-    text_embs         float32 [N, 768]   DistilBERT [CLS] embeddings
-    text_keyword_vecs float32 [N, 64]    keyword indicator vectors (matching feature-extractor.js)
-    labels            int8    [N]        1 = sponsor, 0 = non-sponsor
-    video_duration    float32 scalar
+    segments           float32 [N, 2]     window start/end seconds
+    audio_embs         float32 [N, 384]   Whisper mean-pooled encoder embeddings
+    text_embs          float32 [N, 768]   DistilBERT [CLS] embeddings
+    text_keyword_vecs  float32 [N, 128]   keyword indicator vectors (matching feature-extractor.js)
+    labels             int8    [N]        1 = sponsor, 0 = non-sponsor (built with pipeline's min_votes)
+    video_duration     float32 scalar
+    sponsor_segs       float32 [M, 2]     all SponsorBlock segment start/end times (min_votes=1)
+    sponsor_seg_votes  int32   [M]        community vote count per segment
 
 Requirements:
     pip install torch transformers yt-dlp numpy tqdm
@@ -40,8 +42,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterator
@@ -185,9 +185,15 @@ def keyword_vector(text: str) -> np.ndarray:
 def parse_sponsorblock_csv(
     csv_path: Path,
     category: str = "sponsor",
-    min_votes: int = MIN_VOTES,
-) -> dict[str, list[tuple[float, float]]]:
-    """Parse sponsorTimes.csv and return a mapping videoId → list of (start, end) tuples.
+    min_votes: int = 1,
+) -> dict[str, list[tuple[float, float, int]]]:
+    """Parse sponsorTimes.csv and return a mapping videoId → list of (start, end, votes) tuples.
+
+    By default (min_votes=1) this returns ALL non-negative-vote segments so that
+    per-segment vote counts are preserved in the npz cache.  Pass min_votes > 1
+    to pre-filter at parse time (e.g. for audit purposes); the data pipeline
+    always parses with min_votes=1 and re-filters at training time using the
+    stored vote arrays.
 
     Filters:
       * category == ``category``
@@ -198,13 +204,13 @@ def parse_sponsorblock_csv(
     Args:
         csv_path:  Path to sponsorTimes.csv (downloaded from SponsorBlock mirrors).
         category:  Segment category to keep (default: "sponsor").
-        min_votes: Minimum community votes threshold.
+        min_votes: Minimum community votes threshold (default 1 — keep all).
 
     Returns:
-        Dict mapping videoId strings to sorted lists of (start_sec, end_sec) pairs.
+        Dict mapping videoId strings to sorted lists of (start_sec, end_sec, votes) triples.
     """
     log.info("Parsing SponsorBlock CSV: %s", csv_path)
-    segments: dict[str, list[tuple[float, float]]] = {}
+    segments: dict[str, list[tuple[float, float, int]]] = {}
 
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -237,7 +243,7 @@ def parse_sponsorblock_csv(
             if end <= start or end - start < 1.0:
                 continue
 
-            segments.setdefault(vid, []).append((start, end))
+            segments.setdefault(vid, []).append((start, end, votes))
 
     # Sort segments within each video.
     for vid in segments:
@@ -248,75 +254,137 @@ def parse_sponsorblock_csv(
 
 
 # ---------------------------------------------------------------------------
-# Caption / transcript fetching (reuses logic from content.js)
+# Caption / transcript fetching via yt-dlp
 # ---------------------------------------------------------------------------
 
 
-def _fetch_caption_url(video_id: str) -> str | None:
-    """Return the timedtext XML URL for a YouTube video, or None."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        log.debug("Failed to fetch watch page for %s: %s", video_id, exc)
-        return None
+def fetch_video_captions(
+    video_id: str,
+    out_dir: Path | None = None,
+    cookies_path: Path | None = None,
+    cookies_from_browser: str | None = None,
+) -> list[tuple[float, float, str]]:
+    """Fetch auto-generated English captions via yt-dlp; return (start, end, text) tuples.
 
-    # Extract ytInitialPlayerResponse JSON blob.
-    match = re.search(r"ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*(?:var\s|</script>)", html, re.DOTALL)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
+    Uses yt-dlp --write-auto-subs to download a .vtt file into a temp directory
+    (or ``out_dir`` if provided), then parses it.  This is far more reliable than
+    scraping the YouTube watch-page HTML, which breaks whenever YouTube restructures
+    their page JavaScript.
 
-    try:
-        tracks = data["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"]
-    except (KeyError, TypeError):
-        return None
-
-    # Prefer English auto-generated, then English, then first available.
-    best = None
-    for track in tracks:
-        lang = track.get("languageCode", "")
-        kind = track.get("kind", "")
-        base_url = track.get("baseUrl", "")
-        if lang == "en" and kind == "asr":
-            return base_url
-        if lang == "en" and best is None:
-            best = base_url
-    return best or (tracks[0].get("baseUrl") if tracks else None)
-
-
-def fetch_video_captions(video_id: str) -> list[tuple[float, float, str]]:
-    """Return a list of (start_sec, end_sec, text) tuples for a video.
-
-    Returns an empty list if captions are unavailable.
+    Returns an empty list if captions are unavailable or yt-dlp fails.
     """
-    caption_url = _fetch_caption_url(video_id)
-    if not caption_url:
-        return []
+    import contextlib
+
+    @contextlib.contextmanager
+    def _tmp_or_provided(d: Path | None):
+        if d is not None:
+            yield d
+        else:
+            with tempfile.TemporaryDirectory(prefix="yt_caps_") as t:
+                yield Path(t)
+
+    with _tmp_or_provided(out_dir) as work_dir:
+        out_tmpl = str(work_dir / f"{video_id}.%(ext)s")
+        cmd = [
+            "yt-dlp",
+            "--quiet", "--no-warnings",
+            "--skip-download",           # captions only — no audio
+            "--write-auto-subs",         # prefer auto-generated captions
+            "--write-subs",              # fall back to manual subs if ASR unavailable
+            "--sub-lang", "en",
+            "--sub-format", "vtt",
+            "--js-runtimes", "node",
+            "--remote-components", "ejs:github",
+            "-o", out_tmpl,
+        ]
+        if cookies_from_browser:
+            cmd += ["--cookies-from-browser", cookies_from_browser]
+        elif cookies_path is not None and cookies_path.exists():
+            cmd += ["--cookies", str(cookies_path)]
+        cmd += ["--", f"https://www.youtube.com/watch?v={video_id}"]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            log.debug("yt-dlp caption fetch failed for %s (rc=%d): %s",
+                      video_id, result.returncode, (result.stderr or result.stdout)[:200])
+            return []
+
+        # yt-dlp writes  <id>.en.vtt  or  <id>.en-US.vtt  etc.
+        vtt_files = list(work_dir.glob(f"{video_id}*.vtt"))
+        if not vtt_files:
+            log.debug("No VTT file found for %s after yt-dlp run", video_id)
+            return []
+
+        return _parse_vtt(vtt_files[0])
+
+
+def _parse_vtt(vtt_path: Path) -> list[tuple[float, float, str]]:
+    """Parse a WebVTT file; return (start_sec, end_sec, text) tuples.
+
+    Handles YouTube's auto-generated VTT format, which includes duplicate
+    lines with word-level timestamps in ``<HH:MM:SS.mmm>`` tags — these are
+    stripped, and back-to-back duplicate cues are deduplicated.
+    """
+    def _ts_to_sec(ts: str) -> float:
+        """Convert HH:MM:SS.mmm or MM:SS.mmm to seconds."""
+        parts = ts.strip().split(":")
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        elif len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        return float(parts[0])
 
     try:
-        data = urllib.request.urlopen(caption_url, timeout=10).read()
-        root = ET.fromstring(data)
+        raw = vtt_path.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
-        log.debug("Caption fetch failed for %s: %s", video_id, exc)
+        log.debug("VTT read failed for %s: %s", vtt_path, exc)
         return []
 
     cues: list[tuple[float, float, str]] = []
-    for elem in root.iter("text"):
-        try:
-            start = float(elem.get("start", "0"))
-            dur = float(elem.get("dur", "0"))
-        except ValueError:
-            continue
-        text = re.sub(r"<[^>]+>", "", elem.text or "")
-        text = text.replace("&#39;", "'").replace("&amp;", "&").replace("&quot;", '"')
-        text = text.strip()
-        if text:
-            cues.append((start, start + dur, text))
+    prev_text = None
+
+    lines = raw.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # Look for timestamp lines: "00:00:05.000 --> 00:00:10.000"
+        if "-->" in line:
+            ts_parts = line.split("-->")
+            if len(ts_parts) == 2:
+                try:
+                    start = _ts_to_sec(ts_parts[0].strip())
+                    # Strip positioning tags from end timestamp (e.g. "00:05.000 align:start")
+                    end_str = ts_parts[1].strip().split()[0]
+                    end = _ts_to_sec(end_str)
+                except (ValueError, IndexError):
+                    i += 1
+                    continue
+
+                # Collect text lines until blank line or next timestamp.
+                i += 1
+                text_lines = []
+                while i < len(lines) and lines[i].strip() and "-->" not in lines[i]:
+                    text_lines.append(lines[i].strip())
+                    i += 1
+
+                text = " ".join(text_lines)
+                # Strip inline timestamp tags: <00:00:05.000>, <c>, </c>, etc.
+                text = re.sub(r"<[^>]+>", "", text)
+                # Unescape HTML entities.
+                text = (text.replace("&amp;", "&").replace("&#39;", "'")
+                            .replace("&quot;", '"').replace("&lt;", "<")
+                            .replace("&gt;", ">").replace("&nbsp;", " "))
+                text = text.strip()
+
+                # YouTube ASR emits the same line repeatedly as words arrive;
+                # skip exact duplicates of the previous cue.
+                if text and text != prev_text and end > start:
+                    cues.append((start, end, text))
+                    prev_text = text
+                continue
+        i += 1
+
+    log.debug("Parsed %d caption cues from %s", len(cues), vtt_path.name)
     return cues
 
 
@@ -599,7 +667,7 @@ def compute_distilbert_embeddings(
 
 def process_video(
     video_id: str,
-    sponsor_segments: list[tuple[float, float]],
+    sponsor_segments: list[tuple[float, float, int]],
     cache_dir: Path,
     whisper_model,
     whisper_processor,
@@ -612,6 +680,7 @@ def process_video(
     sleep_interval: float = 0.0,
     force: bool = False,
     force_zero_audio: bool = False,
+    min_votes: int = MIN_VOTES,
 ) -> bool:
     """Process one video end-to-end and write <cache_dir>/<video_id>.npz.
 
@@ -630,8 +699,12 @@ def process_video(
             log.debug("Cache hit: %s", video_id)
             return True
 
-    # Fetch captions.
-    cues = fetch_video_captions(video_id)
+    # Fetch captions via yt-dlp (auth params shared with audio download).
+    cues = fetch_video_captions(
+        video_id,
+        cookies_path=cookies_path,
+        cookies_from_browser=cookies_from_browser,
+    )
 
     with tempfile.TemporaryDirectory(prefix=f"ytdl_{video_id}_") as tmp:
         tmp_dir = Path(tmp)
@@ -657,8 +730,18 @@ def process_video(
         if video_duration < MIN_VIDEO_DURATION_SEC:
             return False
 
-        # Build windows.
-        windows = build_windows(cues, video_duration, sponsor_segments)
+        # Split into qualifying (meets min_votes) and all segments.
+        # Labeling uses only qualifying segments; we store all for later re-filtering.
+        qualifying_segs = [(s, e) for (s, e, v) in sponsor_segments if v >= min_votes]
+        sponsor_segs_arr = np.array(
+            [[s, e] for (s, e, v) in sponsor_segments], dtype=np.float32
+        ).reshape(-1, 2)
+        sponsor_seg_votes_arr = np.array(
+            [v for (s, e, v) in sponsor_segments], dtype=np.int32
+        )
+
+        # Build windows (labels based on qualifying segments only).
+        windows = build_windows(cues, video_duration, qualifying_segs)
         if not windows:
             return False
 
@@ -702,6 +785,26 @@ def process_video(
         else:
             text_embs = np.zeros((N, DISTILBERT_DIM), dtype=np.float32)
 
+        # Spot-check: log first window's text embedding snippet.
+        first_nonconst = next(
+            (i for i in range(len(text_embs)) if np.any(text_embs[i])), None
+        )
+        if first_nonconst is not None:
+            snippet = text_embs[first_nonconst, :8]
+            log.info(
+                "  text_emb[win=%d] snippet: [%s]",
+                first_nonconst,
+                ", ".join(f"{v:.4f}" for v in snippet),
+            )
+            # Also warn if all windows are identical (caption fetch likely failed).
+            if np.allclose(text_embs, text_embs[0]):
+                log.warning(
+                    "  text_embs: all windows IDENTICAL for %s — captions may be empty ([UNK] fallback)",
+                    video_id,
+                )
+        else:
+            log.warning("  text_embs: ALL ZERO for %s — DistilBERT may have failed", video_id)
+
         # Save.
         np.savez_compressed(
             out_path,
@@ -711,8 +814,13 @@ def process_video(
             text_keyword_vecs=keyword_vecs,
             labels=labels,
             video_duration=np.float32(video_duration),
+            # Per-segment vote data — stored for runtime re-labeling at training time.
+            # sponsor_segs:       float32 [M, 2]  all sponsor segment start/end times
+            # sponsor_seg_votes:  int32   [M]     community vote count per segment
+            sponsor_segs=sponsor_segs_arr,
+            sponsor_seg_votes=sponsor_seg_votes_arr,
         )
-        log.info("Saved %s  (N=%d, sponsors=%d)", out_path.name, N, labels.sum())
+        log.info("Saved %s  (N=%d, sponsors=%d, segs=%d)", out_path.name, N, labels.sum(), len(sponsor_segs_arr))
 
     return True
 
@@ -736,6 +844,7 @@ def run_batch(
     sleep_interval: float = 0.0,
     force: bool = False,
     force_zero_audio: bool = False,
+    min_votes: int = MIN_VOTES,
 ) -> None:
     """Process up to ``n_videos`` random videos and cache their embeddings.
 
@@ -752,11 +861,18 @@ def run_batch(
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Parse SponsorBlock CSV.
-    sponsor_map = parse_sponsorblock_csv(csv_path)
+    # Parse SponsorBlock CSV with min_votes=1 to capture ALL segments with their
+    # vote counts.  We store the full vote data in each npz so that the training
+    # loop can re-label windows at any min_votes threshold without re-running the
+    # pipeline.  Video selection still respects the caller's min_votes threshold
+    # (only include videos that have at least one qualifying sponsor segment).
+    sponsor_map = parse_sponsorblock_csv(csv_path, min_votes=1)
 
-    # Sample videos.
-    all_ids = list(sponsor_map.keys())
+    # Sample videos — only include those with ≥1 segment meeting the threshold.
+    all_ids = [
+        vid for vid, segs in sponsor_map.items()
+        if any(v >= min_votes for (_, _, v) in segs)
+    ]
     random.seed(seed)
     random.shuffle(all_ids)
     # Skip already-cached (unless --force / --force-zero-audio) and any IDs passed via --skip-ids.
@@ -844,6 +960,7 @@ def run_batch(
                 sleep_interval=sleep_interval,
                 force=force,
                 force_zero_audio=force_zero_audio,
+                min_votes=min_votes,
             )
             if ok:
                 success += 1
@@ -868,11 +985,19 @@ class SponsorDataset:
     """Iterable dataset over cached .npz files.
 
     Yields dicts with keys:
-        keyword_vec  float32 [64]
+        keyword_vec  float32 [128]
         audio_emb    float32 [WHISPER_DIM]   (from Whisper mean-pool)
         text_emb     float32 [DISTILBERT_DIM]
         label        int8 scalar
         video_id     str
+
+    Args:
+        min_votes: If > 0 and the npz contains ``sponsor_segs`` / ``sponsor_seg_votes``
+                   arrays (written by data_pipeline.py), window labels are recomputed
+                   from scratch using only segments whose vote count ≥ min_votes.
+                   This lets you change the quality threshold without re-running the
+                   embedding pipeline.  Falls back to stored labels for files that
+                   pre-date the vote arrays (backward-compatible).
     """
 
     def __init__(
@@ -881,10 +1006,12 @@ class SponsorDataset:
         video_ids: list[str] | None = None,
         require_audio: bool = True,
         require_text: bool = True,
+        min_votes: int = 0,
     ) -> None:
         self.cache_dir = cache_dir
         self.require_audio = require_audio
         self.require_text = require_text
+        self.min_votes = min_votes
 
         if video_ids is not None:
             self.video_ids = video_ids
@@ -893,7 +1020,10 @@ class SponsorDataset:
 
         # Flatten all windows into a list of (video_id, window_index) pairs.
         self._index: list[tuple[str, int]] = []
+        # Per-video recomputed label arrays (only populated when min_votes > 0).
+        self._recomputed_labels: dict[str, np.ndarray] = {}
         skipped_audio = 0
+        n_recomputed = 0
         for vid in self.video_ids:
             path = cache_dir / f"{vid}.npz"
             if not path.exists():
@@ -905,11 +1035,64 @@ class SponsorDataset:
                 skipped_audio += 1
                 continue
             n = len(data["labels"])
+
+            # Re-label windows from stored vote data if requested.
+            if min_votes > 0 and "sponsor_segs" in data.files and "sponsor_seg_votes" in data.files:
+                recomputed = self._recompute_labels(
+                    window_bounds=data["segments"],
+                    sponsor_segs=data["sponsor_segs"],
+                    sponsor_seg_votes=data["sponsor_seg_votes"],
+                    min_votes=min_votes,
+                )
+                self._recomputed_labels[vid] = recomputed
+                n_recomputed += 1
+
             self._index.extend((vid, i) for i in range(n))
 
         if skipped_audio:
             log.info("SponsorDataset: skipped %d videos with all-zero audio embeddings", skipped_audio)
+        if min_votes > 0:
+            log.info(
+                "SponsorDataset: recomputed labels for %d/%d videos (min_votes=%d); "
+                "%d videos used stored labels (pre-date vote arrays)",
+                n_recomputed, len(self.video_ids) - skipped_audio,
+                min_votes, len(self.video_ids) - skipped_audio - n_recomputed,
+            )
         log.info("SponsorDataset: %d windows across %d videos", len(self._index), len(self.video_ids) - skipped_audio)
+
+    @staticmethod
+    def _recompute_labels(
+        window_bounds: np.ndarray,
+        sponsor_segs: np.ndarray,
+        sponsor_seg_votes: np.ndarray,
+        min_votes: int,
+    ) -> np.ndarray:
+        """Recompute window labels from per-segment vote data.
+
+        A window is labelled 1 if it overlaps any qualifying sponsor segment
+        (votes ≥ min_votes) by ≥ 50%.
+
+        Args:
+            window_bounds:      float32 [N, 2]  window start/end times.
+            sponsor_segs:       float32 [M, 2]  all sponsor segment start/end times.
+            sponsor_seg_votes:  int32   [M]     community votes per segment.
+            min_votes:          Minimum votes to qualify a segment for labeling.
+
+        Returns:
+            int8 [N] label array.
+        """
+        qualifying = sponsor_segs[sponsor_seg_votes >= min_votes]  # [K, 2]
+        labels = np.zeros(len(window_bounds), dtype=np.int8)
+        for i, (t_start, t_end) in enumerate(window_bounds):
+            window_len = float(t_end - t_start)
+            if window_len <= 0:
+                continue
+            for (s_start, s_end) in qualifying:
+                overlap = max(0.0, min(float(t_end), float(s_end)) - max(float(t_start), float(s_start)))
+                if overlap / window_len >= 0.5:
+                    labels[i] = 1
+                    break
+        return labels
 
     def __len__(self) -> int:
         return len(self._index)
@@ -930,11 +1113,16 @@ class SponsorDataset:
             # Pad old 64-dim cache files to 128-dim (new dims fire as 0 for old videos).
             if kw.shape[0] < 128:
                 kw = np.concatenate([kw, np.zeros(128 - kw.shape[0], dtype=np.float32)])
+            # Use recomputed labels when min_votes > 0 and vote data was available.
+            if vid in self._recomputed_labels:
+                label = int(self._recomputed_labels[vid][idx])
+            else:
+                label = int(data["labels"][idx])
             yield {
                 "keyword_vec": kw,
                 "audio_emb": data["audio_embs"][idx].astype(np.float32),
                 "text_emb": data["text_embs"][idx].astype(np.float32),
-                "label": int(data["labels"][idx]),
+                "label": label,
                 "video_id": vid,
             }
 
@@ -998,6 +1186,8 @@ def main() -> None:
     p.add_argument("--force-zero-audio", action="store_true",
                    help="Re-process only cached videos whose audio embeddings are all zero. "
                         "Skips videos that already have good audio. Use this to resume after fixing Whisper.")
+    p.add_argument("--min-votes", type=int, default=MIN_VOTES,
+                   help=f"Minimum SponsorBlock community votes to trust a segment (default: {MIN_VOTES}).")
     args = p.parse_args()
 
     extra_skip: set[str] = set()
@@ -1019,6 +1209,7 @@ def main() -> None:
         sleep_interval=args.sleep,
         force=args.force,
         force_zero_audio=args.force_zero_audio,
+        min_votes=args.min_votes,
     )
 
 
