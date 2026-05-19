@@ -1,0 +1,12 @@
+{
+  "_comment": "Best hyperparameters for embed_mode=both (DistilBERT + Whisper + CrossAttention + BiLSTM).",
+  "_source": "Phase 1 Optuna search (lr/wd/drop/lstm_hidden/batch) + Phase 2 search (lstm_layers/pos_weight_mult). Best F1 ~0.78 on val split (~6,900 videos).",
+  "embed_mode": "both",
+  "lr": 5.39e-05,
+  "weight_decay": 8.12e-03,
+  "dropout": 0.21,
+  "lstm_hidden": 256,
+  "lstm_layers": 2,
+  "seq_batch_size": 4,
+  "pos_weight_mult": 1.87
+}

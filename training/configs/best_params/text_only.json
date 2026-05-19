@@ -1,0 +1,4 @@
+{
+  "_comment": "Best hyperparameters for embed_mode=text_only (DistilBERT only). PENDING — tune job not yet run.",
+  "embed_mode": "text_only"
+}

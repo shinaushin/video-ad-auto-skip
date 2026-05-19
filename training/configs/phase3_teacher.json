@@ -5,10 +5,14 @@
   "cache_dir": "/tmp/embeddings_cache",
   "output_dir": "/tmp/outputs/teacher",
   "epochs": 200,
-  "seq_batch_size": 8,
-  "lr": 5e-4,
-  "weight_decay": 1e-4,
   "patience": 15,
   "device": "auto",
-  "seed": 42
+  "seed": 42,
+  "lr": 5.39e-05,
+  "weight_decay": 8.12e-03,
+  "dropout": 0.21,
+  "lstm_hidden": 256,
+  "lstm_layers": 2,
+  "seq_batch_size": 4,
+  "pos_weight_mult": 1.87
 }
