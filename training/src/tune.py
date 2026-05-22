@@ -105,23 +105,23 @@ def objective(
     """Train a teacher model with trial-suggested hyperparameters; return best val_f1."""
 
     # ── Hyperparameter suggestions ─────────────────────────────────────────
-    # Structural params fixed from best `both` trial — not modality-sensitive.
-    weight_decay   = 8.12e-03
-    dropout        = 0.21
-    lstm_hidden    = 256
-    lstm_layers    = 2
-    seq_batch_size = 4
-
-    # Active search: lr and pos_weight_mult are modality-sensitive.
-    # `both` best values were lr=5.39e-05, pw=1.87 — other modalities may
-    # need a higher lr to escape class collapse and a different pw.
-    lr              = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
-    pos_weight_mult = trial.suggest_float("pos_weight_mult", 1.0, 6.0)
+    # Full open search — all params active now that text embeddings are real.
+    # Previous best (both, audio-only embeddings): lr=5.39e-05, wd=8.12e-3,
+    # dropout=0.21, lstm_hidden=256, lstm_layers=2, batch=4, pw=1.87.
+    # Ranges are wide enough to rediscover those values if they're still optimal,
+    # but open to exploring larger/smaller configs with real text signal.
+    lr              = trial.suggest_float("lr",             1e-5,  1e-3,  log=True)
+    weight_decay    = trial.suggest_float("weight_decay",   1e-5,  1e-1,  log=True)
+    dropout         = trial.suggest_float("dropout",        0.1,   0.5)
+    lstm_hidden     = trial.suggest_categorical("lstm_hidden",     [128, 192, 256, 384])
+    lstm_layers     = trial.suggest_int("lstm_layers",      1,     3)
+    seq_batch_size  = 4  # fixed — larger batches dilute sparse sponsor sequences
+    pos_weight_mult = trial.suggest_float("pos_weight_mult", 1.0,  8.0)
 
     log.info(
-        "Trial %d | lr=%.2e wd=%.2e drop=%.2f lstm_h=%d lstm_l=%d batch=%d pw=%.2f",
+        "Trial %d | lr=%.2e wd=%.2e drop=%.2f lstm_h=%d lstm_l=%d pw=%.2f",
         trial.number, lr, weight_decay, dropout, lstm_hidden, lstm_layers,
-        seq_batch_size, pos_weight_mult,
+        pos_weight_mult,
     )
 
     # ── Build model with trial architecture ───────────────────────────────
@@ -300,14 +300,39 @@ def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = Non
     if tb_dir:
         log.info("TensorBoard logs → %s", tb_dir)
 
-    study.optimize(
-        lambda trial: objective(
+    best_so_far = {"val_f1": -1.0}
+
+    def _objective_with_checkpoint(trial: optuna.Trial) -> float:
+        val_f1 = objective(
             trial, train_ds, val_ds, device, tune_epochs, tune_patience,
             reporter=reporter,
             tb_dir=tb_dir,
             gcs_output=gcs_output,
             embed_mode=embed_mode,
-        ),
+        )
+        # Write best_params.json after every trial that sets a new best —
+        # so it's available even if the job is killed before completing.
+        if val_f1 > best_so_far["val_f1"]:
+            best_so_far["val_f1"] = val_f1
+            interim_params = {
+                **trial.params,
+                "embed_mode":    embed_mode,
+                "_best_val_f1":  val_f1,
+                "_best_trial":   trial.number,
+                "_note": "Written mid-run; updated whenever a new best is found.",
+            }
+            best_path = output_dir / "best_params.json"
+            best_path.write_text(json.dumps(interim_params, indent=2))
+            log.info(
+                "  ★ New best! Trial %d  val_f1=%.4f — best_params.json updated",
+                trial.number, val_f1,
+            )
+            if gcs_output and _HAS_GCP_UTILS:
+                upload_to_gcs(str(output_dir), f"{gcs_output}")
+        return val_f1
+
+    study.optimize(
+        _objective_with_checkpoint,
         n_trials=n_trials,
         catch=(RuntimeError, ValueError),  # log exceptions, don't abort the study
     )
