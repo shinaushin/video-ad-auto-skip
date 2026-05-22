@@ -4,7 +4,7 @@
   "description": "Optuna hyperparameter search for teacher model (DistilBERT + Whisper + CrossAttention + BiLSTM) on Vertex AI.",
   "cache_dir": "/tmp/embeddings_cache",
   "output_dir": "/tmp/outputs/tune",
-  "n_trials": 25,
+  "n_trials": 100,
   "tune_epochs": 70,
   "tune_patience": 12,
   "device": "auto",
