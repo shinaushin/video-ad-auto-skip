@@ -105,21 +105,22 @@ def objective(
     """Train a teacher model with trial-suggested hyperparameters; return best val_f1."""
 
     # ── Hyperparameter suggestions ─────────────────────────────────────────
-    # Full open search — all params active now that text embeddings are real.
-    # Previous best (both, audio-only embeddings): lr=5.39e-05, wd=8.12e-3,
-    # dropout=0.21, lstm_hidden=256, lstm_layers=2, batch=4, pw=1.87.
-    # Ranges are wide enough to rediscover those values if they're still optimal,
-    # but open to exploring larger/smaller configs with real text signal.
-    lr              = trial.suggest_float("lr",             1e-5,  1e-3,  log=True)
-    weight_decay    = trial.suggest_float("weight_decay",   1e-5,  1e-1,  log=True)
-    dropout         = trial.suggest_float("dropout",        0.1,   0.5)
-    lstm_hidden     = trial.suggest_categorical("lstm_hidden",     [128, 192, 256, 384])
-    lstm_layers     = trial.suggest_int("lstm_layers",      1,     3)
-    seq_batch_size  = 4  # fixed — larger batches dilute sparse sponsor sequences
-    pos_weight_mult = trial.suggest_float("pos_weight_mult", 1.0,  8.0)
+    # Fixed params from best 6K-video tune — architectural and class-balance
+    # params are stable across dataset sizes; only regularization and lr need
+    # retuning when scaling to larger dataset.
+    lstm_hidden     = 384    # best from 6K tune
+    lstm_layers     = 3      # best from 6K tune
+    pos_weight_mult = 1.87   # best from 6K tune
+    seq_batch_size  = 4      # fixed — larger batches dilute sparse sponsor sequences
+
+    # Active search: regularization params expected to shift with dataset size.
+    # lr range raised (1e-4 – 1e-3): larger dataset supports higher lr.
+    lr           = trial.suggest_float("lr",           1e-4,  1e-3,  log=True)
+    weight_decay = trial.suggest_float("weight_decay", 1e-5,  1e-1,  log=True)
+    dropout      = trial.suggest_float("dropout",      0.1,   0.5)
 
     log.info(
-        "Trial %d | lr=%.2e wd=%.2e drop=%.2f lstm_h=%d lstm_l=%d pw=%.2f",
+        "Trial %d | lr=%.2e wd=%.2e drop=%.2f  [lstm_h=%d lstm_l=%d pw=%.2f fixed]",
         trial.number, lr, weight_decay, dropout, lstm_hidden, lstm_layers,
         pos_weight_mult,
     )
