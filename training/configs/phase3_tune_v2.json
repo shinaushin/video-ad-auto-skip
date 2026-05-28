@@ -1,0 +1,13 @@
+{
+  "name": "yt-sponsor-phase3-tune-v2",
+  "phase": "tune",
+  "description": "Optuna hyperparameter search — v2 architecture (2-layer CrossAttention + FFN sublayers).",
+  "arch_variant": "v2",
+  "cache_dir": "/tmp/embeddings_cache",
+  "output_dir": "/tmp/outputs/tune",
+  "n_trials": 40,
+  "tune_epochs": 70,
+  "tune_patience": 12,
+  "device": "auto",
+  "seed": 42
+}

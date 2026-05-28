@@ -101,6 +101,7 @@ def objective(
     tb_dir: Optional[str] = None,
     gcs_output: Optional[str] = None,
     embed_mode: str = "both",
+    arch_variant: str = "v1",
 ) -> float:
     """Train a teacher model with trial-suggested hyperparameters; return best val_f1."""
 
@@ -120,13 +121,13 @@ def objective(
     dropout      = trial.suggest_float("dropout",      0.1,   0.5)
 
     log.info(
-        "Trial %d | lr=%.2e wd=%.2e drop=%.2f  [lstm_h=%d lstm_l=%d pw=%.2f fixed]",
+        "Trial %d | lr=%.2e wd=%.2e drop=%.2f  [lstm_h=%d lstm_l=%d pw=%.2f arch=%s fixed]",
         trial.number, lr, weight_decay, dropout, lstm_hidden, lstm_layers,
-        pos_weight_mult,
+        pos_weight_mult, arch_variant,
     )
 
     # ── Build model with trial architecture ───────────────────────────────
-    model     = TeacherModel(lstm_hidden=lstm_hidden, lstm_layers=lstm_layers, dropout=dropout, embed_mode=embed_mode).to(device)
+    model     = TeacherModel(lstm_hidden=lstm_hidden, lstm_layers=lstm_layers, dropout=dropout, embed_mode=embed_mode, arch_variant=arch_variant).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
     criterion = nn.BCEWithLogitsLoss(
@@ -231,6 +232,7 @@ def objective(
                 "seq_batch_size": seq_batch_size,
                 "pos_weight_mult": pos_weight_mult,
                 "embed_mode":     embed_mode,
+                "arch_variant":   arch_variant,
             },
             {"hparam/best_val_f1": best_val_f1},
         )
@@ -244,7 +246,7 @@ def objective(
 # ---------------------------------------------------------------------------
 
 
-def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None, gcs_output: Optional[str] = None, embed_mode: str = "both") -> Path:
+def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None, gcs_output: Optional[str] = None, embed_mode: str = "both", arch_variant: str = "v1") -> Path:
     """Run the Optuna study and save results to output_dir."""
     cache_dir   = Path(cfg["cache_dir"])
     output_dir  = Path(cfg["output_dir"])
@@ -287,7 +289,7 @@ def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = Non
         direction="maximize",
         sampler=sampler,
         pruner=pruner,
-        study_name=f"teacher-hparam-search-{embed_mode}",
+        study_name=f"teacher-hparam-search-{embed_mode}-{arch_variant}",
         storage=f"sqlite:///{db_path}",
         load_if_exists=True,   # resume if kernel is interrupted and restarted
     )
@@ -303,6 +305,8 @@ def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = Non
 
     best_so_far = {"val_f1": -1.0}
 
+    log.info("arch_variant=%s", arch_variant)
+
     def _objective_with_checkpoint(trial: optuna.Trial) -> float:
         val_f1 = objective(
             trial, train_ds, val_ds, device, tune_epochs, tune_patience,
@@ -310,6 +314,7 @@ def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = Non
             tb_dir=tb_dir,
             gcs_output=gcs_output,
             embed_mode=embed_mode,
+            arch_variant=arch_variant,
         )
         # Write best_params.json after every trial that sets a new best —
         # so it's available even if the job is killed before completing.
@@ -318,6 +323,7 @@ def run_tune(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = Non
             interim_params = {
                 **trial.params,
                 "embed_mode":    embed_mode,
+                "arch_variant":  arch_variant,
                 "_best_val_f1":  val_f1,
                 "_best_trial":   trial.number,
                 "_note": "Written mid-run; updated whenever a new best is found.",
@@ -497,7 +503,9 @@ def main() -> None:
         reporter = MetricsReporter(phase="tune", job_name=args.job_name)
 
     # ── Run tuning ─────────────────────────────────────────────────────────
-    run_tune(cfg, device, reporter=reporter, gcs_output=gcs_output, embed_mode=args.embed_mode)
+    arch_variant = cfg.get("arch_variant", "v1")
+    log.info("arch_variant=%s (cross-attention architecture)", arch_variant)
+    run_tune(cfg, device, reporter=reporter, gcs_output=gcs_output, embed_mode=args.embed_mode, arch_variant=arch_variant)
 
     # ── GCS output: upload results + study DB ─────────────────────────────
     if _HAS_GCP_UTILS:
