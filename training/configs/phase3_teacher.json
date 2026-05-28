@@ -8,11 +8,13 @@
   "patience": 15,
   "device": "auto",
   "seed": 42,
-  "lr": 5.39e-05,
-  "weight_decay": 8.12e-03,
-  "dropout": 0.21,
-  "lstm_hidden": 256,
-  "lstm_layers": 2,
+  "lr": 1.38e-04,
+  "weight_decay": 1.47e-04,
+  "dropout": 0.25,
+  "lstm_hidden": 384,
+  "lstm_layers": 3,
   "seq_batch_size": 4,
-  "pos_weight_mult": 1.87
+  "pos_weight_mult": 1.87,
+  "embed_mode": "both",
+  "arch_variant": "v1"
 }
