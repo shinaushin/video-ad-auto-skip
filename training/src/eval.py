@@ -86,7 +86,7 @@ def _eval_student_with_thresholds(
     all_labels: list[int]   = []
 
     with torch.no_grad():
-        for keyword_vec, mfcc, hard_label, _teacher_logit in loader:
+        for keyword_vec, mfcc, hard_label, _teacher_logit, _context, _position in loader:
             keyword_vec = keyword_vec.to(device)
             mfcc        = mfcc.to(device)
             hard_label  = hard_label.to(device)
