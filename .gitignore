@@ -1,0 +1,37 @@
+# Cache directories
+training/cache/
+training/outputs/
+training/kaggle_outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Model checkpoints and large binary artifacts
+*.pt
+*.onnx
+*.npz
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Credentials / cookies
+cookies.txt
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
