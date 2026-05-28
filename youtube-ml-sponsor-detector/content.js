@@ -68,6 +68,14 @@
   /** Poll interval for Stage 2 (ms). One MFCC frame + one inference call. */
   const POLL_MS         = 1000;
 
+  /**
+   * Faster poll interval used during speed mode.
+   * At 16× playback, 1000ms real time = 16 video-seconds between checks —
+   * the model could overshoot the sponsor end by up to 16s. At 100ms real
+   * time = 1.6 video-seconds, which is acceptable overshoot.
+   */
+  const POLL_MS_SPEED   = 100;
+
   /** Duration of each caption grouping window (seconds). */
   const WINDOW_SEC      = 5;
 
@@ -276,7 +284,7 @@
 
   // ─── Stage 2: Real-time bimodal polling ─────────────────────────────────
 
-  function startPolling() {
+  function startPolling(intervalMs = POLL_MS) {
     stopPolling();
 
     const video = getVideo();
@@ -346,7 +354,7 @@
         exitSpeedMode();
       }
 
-    }, POLL_MS);
+    }, intervalMs);
   }
 
   function stopPolling() {
@@ -422,6 +430,10 @@
     video.playbackRate = SPEED_FALLBACK;
     video.muted        = true;
 
+    // Switch to faster polling so the exit check fires every ~1.6 video-seconds
+    // instead of every 16 video-seconds at the normal 1000ms interval.
+    startPolling(POLL_MS_SPEED);
+
     showIndicator(confidence, "speed");
 
     const backend = detector.isTrained ? "ONNX" : "heuristic";
@@ -448,6 +460,8 @@
     console.log(
       `[ML Detector] Speed mode ended at ${video?.currentTime?.toFixed(1) ?? "?"}s — playback restored.`
     );
+    // Return to normal poll rate now that we're back at 1× speed.
+    startPolling(POLL_MS);
   }
 
   /** Reset all playback state — safe to call at any time. */
