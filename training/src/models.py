@@ -3,7 +3,7 @@
 Teacher (used on Kaggle for training):
     DistilBERT[CLS] → Linear(768→384)
     Whisper-tiny encoder → mean-pool → Linear(384→384)
-    CrossAttention(384) fuses the two branches
+    CrossAttention(384) fuses the two branches  [v1: single layer; v2: 2-layer + FFN]
     BiLSTM(384 hidden, 2 layers) over the window sequence
     Linear(768→1) classifier (sigmoid output)
 
@@ -64,7 +64,7 @@ PROJ_DIM = 384
 
 
 class CrossAttentionFusion(nn.Module):
-    """Single-head cross-attention: text queries, audio keys/values.
+    """Single-layer cross-attention: text queries, audio keys/values.  (arch_variant='v1')
 
     Inputs:
         text_proj   [batch, 1, PROJ_DIM]   DistilBERT projection (query)
@@ -84,6 +84,109 @@ class CrossAttentionFusion(nn.Module):
         # audio_proj → key and value
         out, _ = self.attn(query=text_proj, key=audio_proj, value=audio_proj)
         return self.norm(out + text_proj)  # residual
+
+
+class CrossAttentionBlock(nn.Module):
+    """One cross-attention transformer block: Attn → Add&Norm → FFN → Add&Norm.
+
+    Used as the building block for DeepCrossAttentionFusion (arch_variant='v2' / 'v3').
+
+    Deliberately has NO dropout:
+    - CrossAttentionFusion (v1) has no internal dropout and reaches 0.82 F1.
+    - Adding dropout in the cross-attention pathway compounds with the dropout
+      already present in the BiLSTM and classifier, over-regularising the model.
+    - With a single-token sequence (one window at a time), attention-weight dropout
+      randomly zeros the only weight, killing the entire attention output.
+    Regularisation is left entirely to the BiLSTM and classifier layers.
+    """
+
+    def __init__(self, dim: int, n_heads: int, ffn_dim: int) -> None:
+        super().__init__()
+        self.attn  = nn.MultiheadAttention(dim, n_heads, dropout=0.0, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.ffn   = nn.Sequential(
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, dim),
+        )
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, query: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.attn(query, kv, kv)
+        query = self.norm1(query + attn_out)
+        query = self.norm2(query + self.ffn(query))
+        return query
+
+
+class DeepCrossAttentionFusion(nn.Module):
+    """Stacked cross-attention layers (arch_variant='v2').
+
+    Stacks n_layers CrossAttentionFusion modules (the same proven v1 module).
+    No FFN sublayer — depth comes purely from stacking attention+norm blocks.
+
+    Inputs:
+        text_proj   [batch, 1, PROJ_DIM]   DistilBERT projection (query)
+        audio_proj  [batch, 1, PROJ_DIM]   Whisper projection (key/value)
+
+    Output:
+        [batch, 1, PROJ_DIM]
+    """
+
+    def __init__(
+        self,
+        dim: int = PROJ_DIM,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        **kwargs,  # absorb unused args for forward-compat
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([
+            CrossAttentionFusion(dim=dim, n_heads=n_heads)
+            for _ in range(n_layers)
+        ])
+
+    def forward(self, text_proj: torch.Tensor, audio_proj: torch.Tensor) -> torch.Tensor:
+        x = text_proj
+        for layer in self.layers:
+            x = layer(x, audio_proj)
+        return x
+
+
+class DeepCrossAttentionFFN(nn.Module):
+    """Stacked cross-attention blocks with FFN sublayers (arch_variant='v3').
+
+    Proper transformer-style cross-attention: each block is
+    Attn → Add&Norm → FFN → Add&Norm, stacked n_layers times.
+    No dropout inside the blocks — see CrossAttentionBlock docstring.
+
+    Inputs:
+        text_proj   [batch, 1, PROJ_DIM]   DistilBERT projection (query)
+        audio_proj  [batch, 1, PROJ_DIM]   Whisper projection (key/value)
+
+    Output:
+        [batch, 1, PROJ_DIM]
+    """
+
+    def __init__(
+        self,
+        dim: int = PROJ_DIM,
+        n_heads: int = 4,
+        ffn_dim: Optional[int] = None,
+        n_layers: int = 2,
+        **kwargs,  # absorb unused args for forward-compat
+    ) -> None:
+        super().__init__()
+        ffn_dim = ffn_dim or dim * 2
+        self.blocks = nn.ModuleList([
+            CrossAttentionBlock(dim, n_heads, ffn_dim)
+            for _ in range(n_layers)
+        ])
+
+    def forward(self, text_proj: torch.Tensor, audio_proj: torch.Tensor) -> torch.Tensor:
+        x = text_proj
+        for block in self.blocks:
+            x = block(x, audio_proj)
+        return x
 
 
 class TeacherModel(nn.Module):
@@ -110,6 +213,9 @@ class TeacherModel(nn.Module):
         lstm_layers: int = 2,
         dropout: float = 0.1,
         embed_mode: str = "both",
+        arch_variant: str = "v1",
+        n_cross_attn_layers: int = 2,
+        cross_attn_ffn_dim: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -117,13 +223,22 @@ class TeacherModel(nn.Module):
                 "both"       — cross-attention fusion of text + audio (default).
                 "text_only"  — text projection → BiLSTM; audio branch unused.
                 "audio_only" — audio projection → BiLSTM; text branch unused.
+            arch_variant: Cross-attention architecture version.
+                "v1" — original single-layer CrossAttentionFusion (default, no FFN).
+                "v2" — stacked CrossAttentionBlocks with FFN sublayers (deeper fusion).
+            n_cross_attn_layers: Number of stacked blocks for v2 (default 2).
+            cross_attn_ffn_dim:  FFN hidden dim for v2 blocks (default proj_dim * 2).
         """
         super().__init__()
 
         assert embed_mode in ("both", "text_only", "audio_only"), (
             f"embed_mode must be 'both', 'text_only', or 'audio_only'; got {embed_mode!r}"
         )
-        self.embed_mode = embed_mode
+        assert arch_variant in ("v1", "v2", "v3"), (
+            f"arch_variant must be 'v1', 'v2', or 'v3'; got {arch_variant!r}"
+        )
+        self.embed_mode   = embed_mode
+        self.arch_variant = arch_variant
 
         # Project both modalities to the same dimension.
         # (Both projections are always instantiated so checkpoints stay compatible
@@ -140,7 +255,26 @@ class TeacherModel(nn.Module):
         )
 
         # Cross-attention fusion (text attends to audio) — only used in "both" mode.
-        self.cross_attn = CrossAttentionFusion(dim=proj_dim, n_heads=4)
+        # v1: original single-layer fusion (matches all existing checkpoints).
+        # v2: deeper stacked blocks with FFN sublayers; dropout tied to model dropout.
+        if arch_variant == "v3":
+            # Proper transformer blocks: Attn → Add&Norm → FFN → Add&Norm, no dropout.
+            self.cross_attn: nn.Module = DeepCrossAttentionFFN(
+                dim=proj_dim,
+                n_heads=4,
+                ffn_dim=cross_attn_ffn_dim,
+                n_layers=n_cross_attn_layers,
+            )
+        elif arch_variant == "v2":
+            # Simpler: stacked CrossAttentionFusion layers, no FFN.
+            self.cross_attn = DeepCrossAttentionFusion(
+                dim=proj_dim,
+                n_heads=4,
+                n_layers=n_cross_attn_layers,
+            )
+        else:
+            # v1: original single-layer fusion.
+            self.cross_attn = CrossAttentionFusion(dim=proj_dim, n_heads=4)
 
         # BiLSTM for temporal context over the window sequence.
         self.bilstm = nn.LSTM(
@@ -238,8 +372,15 @@ class MFCCConvBranch(nn.Module):
     Processes an [N_FRAMES, MFCC_DIM] sequence with 1-D convolutions along
     the time axis, then adaptive-average-pools to a fixed-size embedding.
 
+    Architecture (3 conv layers, 64→128→128 channels):
+        Conv1d(13→64, k=3) → BN → ReLU
+        Conv1d(64→128, k=3) → BN → ReLU
+        Conv1d(128→128, k=3) → BN → ReLU   ← extra layer vs. original
+        AdaptiveAvgPool1d(1) → [batch, 128]
+        Linear(128→64) → ReLU → Linear(64→out_dim)
+
     Input:  float32 [batch, N_FRAMES, MFCC_DIM]  (13 MFCC coefficients per frame)
-    Output: float32 [batch, 32]
+    Output: float32 [batch, out_dim]
     """
 
     def __init__(
@@ -251,15 +392,20 @@ class MFCCConvBranch(nn.Module):
         # Conv1d expects [batch, channels, length].
         # Treat MFCC_DIM as input channels, N_FRAMES as the sequence length.
         self.conv = nn.Sequential(
-            nn.Conv1d(mfcc_dim, 32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.Conv1d(mfcc_dim, 64,  kernel_size=3, padding=1),
             nn.BatchNorm1d(64),
             nn.ReLU(),
+            nn.Conv1d(64,       128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128,      128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
         )
-        self.pool = nn.AdaptiveAvgPool1d(1)  # → [batch, 64, 1]
+        self.pool = nn.AdaptiveAvgPool1d(1)  # → [batch, 128, 1]
         self.proj = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
             nn.Linear(64, out_dim),
             nn.ReLU(),
         )
@@ -267,9 +413,9 @@ class MFCCConvBranch(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, N_FRAMES, MFCC_DIM]
         x = x.permute(0, 2, 1)              # → [batch, MFCC_DIM, N_FRAMES]
-        x = self.conv(x)                    # → [batch, 64, N_FRAMES]
-        x = self.pool(x).squeeze(-1)        # → [batch, 64]
-        return self.proj(x)                 # → [batch, 32]
+        x = self.conv(x)                    # → [batch, 128, N_FRAMES]
+        x = self.pool(x).squeeze(-1)        # → [batch, 128]
+        return self.proj(x)                 # → [batch, out_dim]
 
 
 class StudentModel(nn.Module):
@@ -297,11 +443,11 @@ class StudentModel(nn.Module):
         fusion_in = 32 + 32 + K_CONTEXT + 1
         self.fusion = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(fusion_in, 32),
+            nn.Linear(fusion_in, 64),
             nn.ReLU(),
-            nn.Linear(32, 16),
+            nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Linear(32, 1),
         )
 
     def forward(
@@ -380,11 +526,25 @@ def build_student(device: str = "cpu") -> StudentModel:
 
 
 def load_teacher(checkpoint_path: str | None, device: str = "cpu") -> TeacherModel:
-    """Load a TeacherModel from a .pt checkpoint file."""
-    model = build_teacher(device=device)
+    """Load a TeacherModel from a .pt checkpoint file.
+
+    Reads the ``config`` dict stored inside the checkpoint to reconstruct the
+    exact architecture (lstm_hidden, lstm_layers, dropout, arch_variant, …)
+    before loading weights.  Falls back to defaults if config is absent.
+    """
     if checkpoint_path:
         state = torch.load(checkpoint_path, map_location=device)
+        cfg = state.get("config", {})
+        model = TeacherModel(
+            lstm_hidden=int(cfg.get("lstm_hidden", 192)),
+            lstm_layers=int(cfg.get("lstm_layers", 1)),
+            dropout=float(cfg.get("dropout", 0.1)),
+            embed_mode=cfg.get("embed_mode", "both"),
+            arch_variant=cfg.get("arch_variant", "v1"),
+        ).to(device)
         model.load_state_dict(state["model_state_dict"])
+    else:
+        model = build_teacher(device=device)
     model.eval()
     return model
 
