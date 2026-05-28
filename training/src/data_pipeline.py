@@ -661,6 +661,96 @@ def compute_distilbert_embeddings(
 
 
 # ---------------------------------------------------------------------------
+# MFCC feature extraction
+# ---------------------------------------------------------------------------
+
+#: Number of MFCC coefficients (must match feature-extractor.js n_mfcc).
+MFCC_DIM = 13
+
+
+def compute_mfcc_features(
+    audio_path: Path,
+    windows: list[dict],
+    n_mfcc: int = MFCC_DIM,
+    fps: int = MFCC_FPS,
+    n_frames: int = N_MFCC_FRAMES,
+) -> np.ndarray:
+    """Compute MFCC features for each window; return float32 [N, n_frames, n_mfcc].
+
+    For each window we extract the ``n_frames`` MFCC frames ending at
+    ``t_start``, matching the rolling buffer that the Chrome extension maintains
+    in real-time at 1 frame/second.  Frames earlier than the start of the audio
+    are zero-padded (matching the extension's behaviour for the first 30 s).
+
+    Args:
+        audio_path: Path to the full downloaded WAV (16 kHz mono).
+        windows:    List of window dicts with a ``t_start`` key (seconds).
+        n_mfcc:     Number of MFCC coefficients (default 13).
+        fps:        MFCC frame rate in Hz (default 1 — matches extension).
+        n_frames:   Rolling buffer length in frames (default 30).
+
+    Returns:
+        Float32 array of shape [N, n_frames, n_mfcc].  Zero rows for windows
+        whose audio could not be processed.
+    """
+    N = len(windows)
+    mfcc_features = np.zeros((N, n_frames, n_mfcc), dtype=np.float32)
+
+    try:
+        import librosa
+    except ImportError:
+        log.warning("librosa not installed — MFCC features will be all zeros. "
+                    "Run: pip install librosa")
+        return mfcc_features
+
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            y, sr = librosa.load(str(audio_path), sr=16000, mono=True)
+    except Exception as exc:
+        log.warning("librosa.load failed for %s: %s", audio_path.name, exc)
+        return mfcc_features
+
+    # hop_length for exactly 1 frame/sec at sr=16000.
+    hop_length = sr // fps  # 16 000 samples/frame
+
+    try:
+        # librosa returns [n_mfcc, T]; we transpose to [T, n_mfcc].
+        mfcc_all = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc,
+                                         hop_length=hop_length).T.astype(np.float32)
+    except Exception as exc:
+        log.warning("MFCC computation failed for %s: %s", audio_path.name, exc)
+        return mfcc_features
+
+    T = len(mfcc_all)
+
+    for i, w in enumerate(windows):
+        # The extension's buffer at decision time holds frames for
+        # [t_start - n_frames, t_start).  Frame index = floor(t * fps).
+        end_frame   = int(w["t_start"] * fps)   # exclusive upper bound
+        start_frame = end_frame - n_frames        # inclusive lower bound
+
+        if end_frame <= 0:
+            # Window is at the very start — no history yet; leave as zeros.
+            continue
+
+        valid_start = max(0, start_frame)
+        valid_end   = min(T, end_frame)
+
+        if valid_end <= valid_start:
+            continue
+
+        chunk = mfcc_all[valid_start:valid_end]  # [K, n_mfcc]
+        k = len(chunk)
+        # Place chunk at the END of the buffer so index [-1] is the most
+        # recent frame, matching the extension's ring-buffer layout.
+        mfcc_features[i, n_frames - k :] = chunk
+
+    return mfcc_features
+
+
+# ---------------------------------------------------------------------------
 # Per-video processing
 # ---------------------------------------------------------------------------
 
@@ -762,6 +852,13 @@ def process_video(
         else:
             audio_embs = np.zeros((N, WHISPER_DIM), dtype=np.float32)
 
+        # Real MFCC features for student model (requires audio).
+        # Shape: [N, N_MFCC_FRAMES, MFCC_DIM] — matches the extension's rolling buffer.
+        if audio_path is not None:
+            mfcc_features = compute_mfcc_features(audio_path, windows)
+        else:
+            mfcc_features = np.zeros((N, N_MFCC_FRAMES, MFCC_DIM), dtype=np.float32)
+
         # Spot-check: log first window's audio embedding snippet so we can
         # visually confirm embeddings are non-zero.
         first_nonzero = next(
@@ -814,6 +911,9 @@ def process_video(
             text_keyword_vecs=keyword_vecs,
             labels=labels,
             video_duration=np.float32(video_duration),
+            # Real MFCC features for student model.
+            # mfcc_features:      float32 [N, N_MFCC_FRAMES, MFCC_DIM]
+            mfcc_features=mfcc_features,
             # Per-segment vote data — stored for runtime re-labeling at training time.
             # sponsor_segs:       float32 [M, 2]  all sponsor segment start/end times
             # sponsor_seg_votes:  int32   [M]     community vote count per segment
@@ -986,8 +1086,9 @@ class SponsorDataset:
 
     Yields dicts with keys:
         keyword_vec  float32 [128]
-        audio_emb    float32 [WHISPER_DIM]   (from Whisper mean-pool)
+        audio_emb    float32 [WHISPER_DIM]              (from Whisper mean-pool)
         text_emb     float32 [DISTILBERT_DIM]
+        mfcc         float32 [N_MFCC_FRAMES, MFCC_DIM]  (zeros for pre-MFCC cache files)
         label        int8 scalar
         video_id     str
 
@@ -1118,10 +1219,17 @@ class SponsorDataset:
                 label = int(self._recomputed_labels[vid][idx])
             else:
                 label = int(data["labels"][idx])
+            # Real MFCC features — zeros for old cache files that pre-date
+            # compute_mfcc_features() (backfill with backfill_mfcc.py).
+            if "mfcc_features" in data:
+                mfcc = data["mfcc_features"][idx].astype(np.float32)  # [N_MFCC_FRAMES, MFCC_DIM]
+            else:
+                mfcc = np.zeros((N_MFCC_FRAMES, MFCC_DIM), dtype=np.float32)
             yield {
                 "keyword_vec": kw,
                 "audio_emb": data["audio_embs"][idx].astype(np.float32),
                 "text_emb": data["text_embs"][idx].astype(np.float32),
+                "mfcc": mfcc,
                 "label": label,
                 "video_id": vid,
             }
@@ -1151,6 +1259,135 @@ class SponsorDataset:
 
 
 # ---------------------------------------------------------------------------
+# MFCC backfill (adds mfcc_features to existing cache files without
+# recomputing Whisper / DistilBERT embeddings)
+# ---------------------------------------------------------------------------
+
+
+def backfill_mfcc(
+    cache_dir: Path,
+    cookies_path: Path | None = None,
+    cookies_from_browser: str | None = None,
+    sleep_interval: float = 1.0,
+    workers: int = 2,
+    force: bool = False,
+) -> None:
+    """Add real MFCC features to existing .npz files that lack them.
+
+    For each cached video that is missing ``mfcc_features``:
+      1. Re-downloads the audio with yt-dlp (same flags as the main pipeline).
+      2. Computes real MFCC at 1 fps with a 30-frame rolling buffer.
+      3. Patches the .npz in-place (atomic rename).
+
+    Videos that already have ``mfcc_features`` are skipped unless *force* is True.
+    Videos whose audio download fails are skipped with a WARNING (their npz is
+    unchanged, so they continue to yield zero MFCC during training).
+
+    Args:
+        cache_dir:              Directory containing .npz files.
+        cookies_path:           Netscape cookies.txt for yt-dlp (optional).
+        cookies_from_browser:   Browser name to pull cookies from (e.g. "chrome").
+        sleep_interval:         Seconds between yt-dlp downloads.
+        workers:                Parallel download threads.
+        force:                  Re-compute MFCC even for files that already have it.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    all_npz = sorted(cache_dir.glob("*.npz"))
+    log.info("Found %d .npz files in %s", len(all_npz), cache_dir)
+
+    todo: list[Path] = []
+    for path in all_npz:
+        try:
+            with np.load(path) as d:
+                has_mfcc = "mfcc_features" in d.files
+        except Exception:
+            has_mfcc = False
+        if not has_mfcc or force:
+            todo.append(path)
+
+    log.info(
+        "%d / %d files need MFCC backfill%s",
+        len(todo), len(all_npz),
+        " (--force active)" if force else "",
+    )
+
+    if not todo:
+        log.info("Nothing to do — all files already have mfcc_features.")
+        return
+
+    ok = skip = fail = 0
+
+    def _process_one(npz_path: Path) -> str:
+        video_id = npz_path.stem
+        try:
+            existing = dict(np.load(npz_path, allow_pickle=False))
+        except Exception as exc:
+            return f"LOAD_ERROR ({exc})"
+
+        if "segments" not in existing:
+            return "SKIP (no segments array)"
+
+        with tempfile.TemporaryDirectory(prefix=f"mfcc_{video_id}_") as tmp:
+            tmp_dir = Path(tmp)
+            audio_path = _download_audio(
+                video_id, tmp_dir,
+                cookies_path=cookies_path,
+                cookies_from_browser=cookies_from_browser,
+                sleep_interval=sleep_interval,
+            )
+            if audio_path is None:
+                return "AUDIO_FAIL"
+
+            # Build minimal window list (just t_start needed for MFCC).
+            segs = existing["segments"]  # [N, 2]  float32
+            windows = [{"t_start": float(s), "t_end": float(e)} for s, e in segs]
+            mfcc_features = compute_mfcc_features(audio_path, windows)
+
+        if not np.any(mfcc_features):
+            return "MFCC_ZERO (librosa produced all zeros)"
+
+        existing["mfcc_features"] = mfcc_features
+        # np.savez_compressed always appends .npz, so the temp file must end in .npz
+        # so the rename source matches what numpy actually wrote.
+        tmp_out = npz_path.with_name(npz_path.stem + "._tmp.npz")
+        try:
+            np.savez_compressed(str(tmp_out), **existing)
+            tmp_out.rename(npz_path)
+        except Exception as exc:
+            tmp_out.unlink(missing_ok=True)
+            return f"WRITE_ERROR ({exc})"
+
+        return f"OK  shape={mfcc_features.shape}"
+
+    n = len(todo)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_process_one, p): p for p in todo}
+        for i, fut in enumerate(as_completed(futures), 1):
+            path   = futures[fut]
+            try:
+                status = fut.result()
+            except Exception as exc:
+                status = f"EXCEPTION ({exc})"
+            prefix = status.split()[0]
+            if prefix == "OK":
+                ok += 1
+            elif prefix == "SKIP":
+                skip += 1
+            else:
+                fail += 1
+                log.warning("[%d/%d] %s  %s", i, n, path.stem, status)
+                continue
+            log.info("[%d/%d] %s  %s", i, n, path.stem, status)
+
+            if sleep_interval > 0 and prefix == "OK":
+                time.sleep(sleep_interval)
+
+    log.info("Backfill complete — OK=%d  SKIP=%d  FAIL=%d  (%.0f%% success)",
+             ok, skip, fail, 100 * ok / max(ok + fail, 1))
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1164,7 +1401,8 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Prepare SponsorBlock embeddings cache for model training."
     )
-    p.add_argument("--csv", required=True, type=Path, help="Path to sponsorTimes.csv")
+    p.add_argument("--csv", required=False, default=None, type=Path,
+                   help="Path to sponsorTimes.csv (not required with --mfcc-only)")
     p.add_argument("--out", required=True, type=Path, help="Cache output directory")
     p.add_argument("--videos", type=int, default=300, help="Max videos to process")
     p.add_argument("--workers", type=int, default=2, help="Parallel workers (currently unused — sequential)")
@@ -1188,7 +1426,26 @@ def main() -> None:
                         "Skips videos that already have good audio. Use this to resume after fixing Whisper.")
     p.add_argument("--min-votes", type=int, default=MIN_VOTES,
                    help=f"Minimum SponsorBlock community votes to trust a segment (default: {MIN_VOTES}).")
+    p.add_argument("--mfcc-only", action="store_true",
+                   help="Backfill mode: add real MFCC features to existing cache files without "
+                        "recomputing Whisper/DistilBERT. --out must point to the cache directory. "
+                        "--csv is not required in this mode.")
     args = p.parse_args()
+
+    # --mfcc-only: patch existing cache without touching embeddings
+    if args.mfcc_only:
+        backfill_mfcc(
+            cache_dir=args.out,
+            cookies_path=args.cookies,
+            cookies_from_browser=args.cookies_from_browser,
+            sleep_interval=args.sleep,
+            workers=args.workers,
+            force=args.force,
+        )
+        return
+
+    if args.csv is None:
+        p.error("--csv is required unless --mfcc-only is set")
 
     extra_skip: set[str] = set()
     if args.skip_ids and args.skip_ids.exists():
