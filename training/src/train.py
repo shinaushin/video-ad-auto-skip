@@ -182,18 +182,18 @@ def collate_teacher_sequences(
 
 
 class StudentWindowDataset(Dataset):
-    """Flat window dataset for student training: (keyword_vec, dummy_mfcc) → label.
+    """Flat window dataset for student training: (keyword_vec, mfcc) → label.
 
     During distillation the ``teacher_logit`` field is populated by running the
     teacher model over the same window embeddings.  When available it overrides
     the hard label for the KD loss.
 
-    Note: the student is trained on keyword vectors + MFCC.  The MFCC frames
-    come from the extension's real-time capturer; during offline training we
-    cannot easily reproduce the exact per-video MFCC sequence.  We therefore
-    use a deterministic-noise surrogate derived from the Whisper embeddings so
-    the CNN learns *structure* from the embeddings rather than random noise.
-    This is replaced with real MFCC at inference time.
+    The MFCC features are real Mel-Frequency Cepstral Coefficients computed at
+    1 frame/sec during Phase 1 caching (see ``compute_mfcc_features()`` in
+    data_pipeline.py).  They match the rolling 30-frame buffer maintained by
+    the Chrome extension's feature-extractor.js at inference time.
+    Cache files that pre-date MFCC support (before backfill_mfcc.py was run)
+    yield zero-filled MFCC tensors.
     """
 
     def __init__(
@@ -221,16 +221,9 @@ class StudentWindowDataset(Dataset):
         item = self._items[idx]
         keyword_vec = torch.from_numpy(item["keyword_vec"])   # [128]
 
-        # Construct surrogate MFCC from Whisper embedding: project 384 → 13, tile N_FRAMES.
-        audio_emb = torch.from_numpy(item["audio_emb"])       # [384]
-        # Simple deterministic projection: take 13 linearly-spaced values from 384 dims,
-        # then add small per-frame positional variation.
-        indices = torch.linspace(0, 383, 13).long()
-        frame_base = audio_emb[indices]                        # [13]
-        # Tile to [N_FRAMES, 13] with small Gaussian jitter (std=0.01) for diversity.
-        torch.manual_seed(idx)  # reproducible per-sample
-        noise = torch.randn(N_FRAMES, 13) * 0.01
-        mfcc = frame_base.unsqueeze(0).expand(N_FRAMES, -1) + noise  # [N_FRAMES, 13]
+        # Real MFCC from the cache: [N_FRAMES, 13].
+        # Falls back to zeros for pre-MFCC cache files (old videos not yet backfilled).
+        mfcc = torch.from_numpy(item["mfcc"])                 # [N_FRAMES, 13]
 
         hard_label = torch.tensor(item["label"], dtype=torch.float32)
 
@@ -491,12 +484,14 @@ def train_teacher(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
     )
 
     # Allow Optuna best_params.json to be pasted directly into the config.
-    lstm_hidden = int(cfg.get("lstm_hidden", 192))
-    lstm_layers = int(cfg.get("lstm_layers", 1))
+    lstm_hidden  = int(cfg.get("lstm_hidden", 192))
+    lstm_layers  = int(cfg.get("lstm_layers", 1))
+    arch_variant = cfg.get("arch_variant", "v1")
     dropout     = float(cfg.get("dropout", 0.1))
     embed_mode  = cfg.get("embed_mode", "both")
     model       = TeacherModel(lstm_hidden=lstm_hidden, lstm_layers=lstm_layers,
-                               dropout=dropout, embed_mode=embed_mode).to(device)
+                               dropout=dropout, embed_mode=embed_mode,
+                               arch_variant=arch_variant).to(device)
     optimizer   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
     pos_weight_mult = float(cfg.get("pos_weight_mult", 1.0))
@@ -753,11 +748,18 @@ def _run_student_epoch(
     train: bool,
     kd_temp: float,
     kd_alpha: float,
-) -> tuple[float, float]:
+) -> tuple[float, float, dict]:
+    """Run one epoch of student training or evaluation.
+
+    Returns:
+        mean_loss  float
+        accuracy   float
+        metrics    dict with f1 / precision / recall (computed from hard labels at thresh=0.5)
+    """
     model.train(train)
     total_loss = 0.0
-    correct = 0
-    total = 0
+    all_preds:  list[int] = []
+    all_labels: list[int] = []
 
     with torch.set_grad_enabled(train):
         for keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input in loader:
@@ -784,14 +786,17 @@ def _run_student_epoch(
                 optimizer.step()
 
             total_loss += loss.item() * len(hard_label)
-            preds = (torch.sigmoid(student_logit) > 0.5).long()
-            correct += (preds == hard_label.long()).sum().item()
-            total += len(hard_label)
+            preds = (torch.sigmoid(student_logit) > 0.5).long().cpu().tolist()
+            all_preds.extend(preds)
+            all_labels.extend(hard_label.long().cpu().tolist())
 
-    return total_loss / max(total, 1), correct / max(total, 1)
+    n = max(len(all_labels), 1)
+    correct = sum(p == l for p, l in zip(all_preds, all_labels))
+    metrics = _eval_metrics(all_preds, all_labels)
+    return total_loss / n, correct / n, metrics
 
 
-def train_distill(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None) -> Path:
+def train_distill(cfg: dict, device: str, reporter: Optional["MetricsReporter"] = None, gcs_output: Optional[str] = None) -> Path:
     """Train the student model via knowledge distillation from the teacher."""
     cache_dir = Path(cfg["cache_dir"])
     output_dir = Path(cfg["output_dir"])
@@ -840,78 +845,123 @@ def train_distill(cfg: dict, device: str, reporter: Optional["MetricsReporter"] 
 
     model = build_student(device=device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+    # Mode="max" so scheduler treats val_f1 as the metric to maximize (higher = better).
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=3, factor=0.5)
     focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
 
-    best_val_loss = float("inf")
+    best_val_f1   = -1.0
+    best_val_loss = float("inf")  # kept for logging only
     epochs_no_improve = 0
     best_ckpt = output_dir / "student_best.pt"
+
+    writer = None
+    tb_dir = None
+    if _HAS_TB:
+        tb_dir = output_dir / "tb"
+        writer = SummaryWriter(log_dir=str(tb_dir))
+        log.info("TensorBoard logs → %s", tb_dir)
 
     training_log: dict = {
         "phase": "distill",
         "epochs": [],
         "best_epoch": 0,
+        "best_val_f1": 0.0,
         "best_val_loss": float("inf"),
     }
 
     log.info("Starting distillation training for %d epochs (T=%.1f alpha=%.2f)", epochs, kd_temp, kd_alpha)
+    log.info("Early stopping: patience=%d epochs on val_f1", patience)
     for epoch in range(1, epochs + 1):
         t0 = time.time()
-        train_loss, train_acc = _run_student_epoch(
+        train_loss, train_acc, train_m = _run_student_epoch(
             model, train_loader, optimizer, focal, device, train=True,
             kd_temp=kd_temp, kd_alpha=kd_alpha,
         )
-        val_loss, val_acc = _run_student_epoch(
+        val_loss, val_acc, val_m = _run_student_epoch(
             model, val_loader, None, focal, device, train=False,
             kd_temp=kd_temp, kd_alpha=kd_alpha,
         )
-        scheduler.step(val_loss)
+        scheduler.step(val_m["f1"])
 
         elapsed = time.time() - t0
+        current_lr = optimizer.param_groups[0]["lr"]
         log.info(
-            "Epoch %2d/%d  train_loss=%.4f  train_acc=%.3f  val_loss=%.4f  val_acc=%.3f  %.1fs",
-            epoch, epochs, train_loss, train_acc, val_loss, val_acc, elapsed,
+            "Epoch %2d/%d  train_loss=%.4f acc=%.3f f1=%.3f  |  val_loss=%.4f acc=%.3f f1=%.3f p=%.3f r=%.3f  lr=%.2e  %.1fs",
+            epoch, epochs,
+            train_loss, train_acc, train_m["f1"],
+            val_loss, val_acc, val_m["f1"],
+            val_m["precision"], val_m["recall"],
+            current_lr, elapsed,
         )
 
         ep_entry = {
             "epoch": epoch,
             "train_loss": train_loss,
             "train_acc": train_acc,
+            "train_f1": train_m["f1"],
             "val_loss": val_loss,
             "val_acc": val_acc,
+            "val_f1": val_m["f1"],
+            "val_precision": val_m["precision"],
+            "val_recall": val_m["recall"],
         }
         training_log["epochs"].append(ep_entry)
 
+        # ── TensorBoard ───────────────────────────────────────────────────
+        if writer is not None:
+            writer.add_scalar("train/loss",      train_loss,         epoch)
+            writer.add_scalar("train/acc",       train_acc,          epoch)
+            writer.add_scalar("train/f1",        train_m["f1"],      epoch)
+            writer.add_scalar("val/loss",        val_loss,           epoch)
+            writer.add_scalar("val/acc",         val_acc,            epoch)
+            writer.add_scalar("val/f1",          val_m["f1"],        epoch)
+            writer.add_scalar("val/precision",   val_m["precision"], epoch)
+            writer.add_scalar("val/recall",      val_m["recall"],    epoch)
+            writer.add_scalar("lr",              current_lr,         epoch)
+            writer.flush()
+            if gcs_output and _HAS_GCP_UTILS and tb_dir is not None:
+                upload_to_gcs(str(tb_dir), f"{gcs_output}/tb")
+
         # ── Cloud Monitoring ──────────────────────────────────────────────
         if reporter is not None:
-            current_lr = optimizer.param_groups[0]["lr"]
             reporter.emit_epoch(
                 epoch,
                 train_loss=train_loss,
                 val_loss=val_loss,
+                val_f1=val_m["f1"],
+                val_precision=val_m["precision"],
+                val_recall=val_m["recall"],
                 lr=current_lr,
             )
 
-        if val_loss < best_val_loss:
+        val_f1 = val_m["f1"]
+        if val_f1 > best_val_f1:
+            best_val_f1   = val_f1
             best_val_loss = val_loss
             epochs_no_improve = 0
-            training_log["best_epoch"] = epoch
+            training_log["best_epoch"]    = epoch
+            training_log["best_val_f1"]   = best_val_f1
             training_log["best_val_loss"] = best_val_loss
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
                     "val_loss": val_loss,
+                    "val_f1": val_f1,
                     "config": cfg,
                 },
                 best_ckpt,
             )
-            log.info("  ✓ Best checkpoint saved (val_loss=%.4f)", val_loss)
+            log.info("  ✓ Best checkpoint saved (val_f1=%.3f  val_loss=%.4f)", val_f1, val_loss)
         else:
             epochs_no_improve += 1
+            log.info("  No improvement (%d/%d)  best_val_f1=%.3f", epochs_no_improve, patience, best_val_f1)
             if epochs_no_improve >= patience:
                 log.info("Early stopping triggered.")
                 break
+
+    if writer is not None:
+        writer.close()
 
     log_path = output_dir / "training_log.json"
     log_path.write_text(json.dumps(training_log, indent=2))
@@ -1065,7 +1115,7 @@ def main() -> None:
     if phase == "teacher":
         train_teacher(cfg, device, reporter=reporter, gcs_output=gcs_output)
     elif phase == "distill":
-        train_distill(cfg, device, reporter=reporter)
+        train_distill(cfg, device, reporter=reporter, gcs_output=gcs_output)
     elif phase == "baseline":
         evaluate_baseline(cfg)
     else:
