@@ -1,0 +1,18 @@
+# @package _global_.training
+# Student distillation hyperparameters — matches phase4_distill.json.
+#
+# KD loss: alpha * KL(teacher_soft || student_soft) + (1-alpha) * focal(student, hard)
+# Baseline (surrogate MFCC, no KD): F1=0.48
+# Current target: retrain with real MFCC + KD re-enabled
+
+lr:              2.0e-4
+weight_decay:    1.0e-4
+epochs:          60
+patience:        10      # EarlyStopping patience (val/f1, mode=max)
+batch_size:      64
+kd_temperature:  3.0    # Softening temperature T (higher = softer teacher labels)
+kd_alpha:        0.4    # Weight on KD loss vs hard label loss
+focal_gamma:     2.0    # Focal loss focusing exponent (0 = standard BCE)
+focal_alpha:     0.5    # Focal loss positive class weight
+min_votes:       0
+teacher_ckpt:    /tmp/teacher_best.pt   # Override with GCS path when running on Vertex

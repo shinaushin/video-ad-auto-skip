@@ -1,0 +1,6 @@
+# @package _global_.data
+# Data paths — override cache_dir / output_dir when running on Vertex AI.
+# GCS download (if gcs.input is set) automatically overrides cache_dir at runtime.
+
+cache_dir:  /tmp/embeddings_cache   # Local path to per-video .npz embedding cache
+output_dir: /tmp/outputs            # Root for checkpoints, TensorBoard logs, training_log.json

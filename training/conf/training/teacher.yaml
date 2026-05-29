@@ -1,0 +1,9 @@
+# @package _global_.training
+# Teacher training hyperparameters — matches phase3_teacher.json best_params.
+
+lr:             1.38e-4
+weight_decay:   1.47e-4
+epochs:         200
+patience:       15      # EarlyStopping patience (val/f1, mode=max)
+seq_batch_size: 4       # Videos per batch (each video = full window sequence)
+min_votes:      0       # Min SponsorBlock community votes to trust a label (0 = use all)

@@ -1,0 +1,40 @@
+# training/conf/config.yaml — Top-level Hydra config for train_lightning.py
+#
+# Change the active model/training group by overriding defaults on the CLI:
+#   python train_lightning.py phase=distill
+#   python train_lightning.py model=teacher training=teacher
+#
+# Any key can be overridden inline:
+#   python train_lightning.py training.lr=5e-5 model.dropout=0.3
+#
+# Hyperparameter sweep (replaces tune.py):
+#   python train_lightning.py --multirun training.lr=1e-4,2e-4,5e-4
+
+defaults:
+  - model: teacher
+  - training: teacher
+  - data: default
+  - _self_
+
+# ── Top-level keys ────────────────────────────────────────────────────────────
+phase: teacher          # teacher | distill | baseline
+seed: 42
+job_name: yt-sponsor-train
+cloud_logging: false    # set true on Vertex AI to attach a Cloud Logging handler
+
+# ── GCS (Vertex AI) ───────────────────────────────────────────────────────────
+# Override these when submitting to Vertex AI:
+#   gcs.input=gs://yt-sponsor-cache/embeddings
+#   gcs.output=gs://yt-sponsor-cache/outputs/run1
+gcs:
+  input: null
+  output: null
+  local_data: /tmp/embeddings_cache
+
+# ── Trainer overrides ─────────────────────────────────────────────────────────
+# Passed directly to lightning.Trainer(**trainer).
+# Examples:
+#   +trainer.fast_dev_run=true          (1 batch smoke test)
+#   +trainer.limit_train_batches=10     (quick local sanity run)
+#   +trainer.accelerator=gpu            (explicit GPU — auto-detected by default)
+trainer: {}

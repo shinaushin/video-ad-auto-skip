@@ -1,0 +1,8 @@
+# @package _global_.model
+# Student model — architecture is fixed in models.py (StudentModel).
+# Capacity was last set to:
+#   MFCCConvBranch: 3 conv layers, 64/128/128 channels
+#   FusionMLP:      68 → 64 → 32 → 1
+# No hyperparameters to tune here; distillation knobs live in training/distill.yaml.
+
+_placeholder: true
