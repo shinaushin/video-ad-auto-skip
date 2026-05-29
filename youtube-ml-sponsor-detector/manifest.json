@@ -11,6 +11,8 @@
         "https://m.youtube.com/*"
       ],
       "js": [
+        "ort.min.js",
+        "ort-env.js",
         "feature-extractor.js",
         "ml-detector.js",
         "content.js"
@@ -25,7 +27,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["model.onnx", "ort.min.js"],
+      "resources": ["model.onnx", "ort.min.js", "ort-wasm-simd.wasm", "ort-wasm.wasm"],
       "matches": ["https://www.youtube.com/*", "https://m.youtube.com/*"]
     }
   ]

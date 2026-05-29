@@ -121,6 +121,12 @@ class MLSponsorDetector {
   async init() {
     try {
       if (typeof ort !== "undefined") {
+        // Point ORT at the extension's own wasm binaries so it doesn't try
+        // to fetch them from https://www.youtube.com/ (which 404s).
+        ort.env.wasm.wasmPaths = {
+          "ort-wasm-simd.wasm": chrome.runtime.getURL("ort-wasm-simd.wasm"),
+          "ort-wasm.wasm":      chrome.runtime.getURL("ort-wasm.wasm"),
+        };
         const modelUrl = chrome.runtime.getURL("model.onnx");
         this._onnxSession = await ort.InferenceSession.create(modelUrl);
         this._useOnnx = true;
@@ -128,7 +134,7 @@ class MLSponsorDetector {
         return;
       }
     } catch (e) {
-      // Silently fall through — model.onnx may not exist yet (expected during dev)
+      console.warn("[ML Detector] ONNX load failed:", e.message);
     }
     console.log("[ML Detector] Using built-in heuristic MLP (no trained model found).");
   }
