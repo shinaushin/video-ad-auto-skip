@@ -146,7 +146,7 @@ class TeacherSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self._sequences)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         windows = self._sequences[idx]
         text_embs = torch.stack(
             [torch.from_numpy(w["text_emb"]) for w in windows]
@@ -157,28 +157,31 @@ class TeacherSequenceDataset(Dataset):
         labels = torch.tensor(
             [w["label"] for w in windows], dtype=torch.float32
         )                                                                      # [T]
-        return text_embs, audio_embs, labels
+        weights = torch.tensor(
+            [w["vote_weight"] for w in windows], dtype=torch.float32
+        )                                                                      # [T]
+        return text_embs, audio_embs, labels, weights
 
 
 def collate_teacher_sequences(
-    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pad variable-length video sequences to the longest one in the batch.
 
     Returns:
-        text_padded   [B, T_max, 768]
-        audio_padded  [B, T_max, 384]
-        labels_padded [B, T_max]  — padding positions marked with -1.0
-        lengths       [B]         — true sequence length per video
+        text_padded    [B, T_max, 768]
+        audio_padded   [B, T_max, 384]
+        labels_padded  [B, T_max]  — padding positions marked with -1.0
+        weights_padded [B, T_max]  — padding positions get weight 0.0
+        lengths        [B]         — true sequence length per video
     """
-    text_list, audio_list, label_list = zip(*batch)
+    text_list, audio_list, label_list, weight_list = zip(*batch)
     lengths = torch.tensor([t.shape[0] for t in text_list], dtype=torch.long)
-    text_padded = nn.utils.rnn.pad_sequence(text_list, batch_first=True)          # [B, T_max, 768]
-    audio_padded = nn.utils.rnn.pad_sequence(audio_list, batch_first=True)        # [B, T_max, 384]
-    labels_padded = nn.utils.rnn.pad_sequence(
-        label_list, batch_first=True, padding_value=-1.0
-    )                                                                               # [B, T_max]
-    return text_padded, audio_padded, labels_padded, lengths
+    text_padded   = nn.utils.rnn.pad_sequence(text_list,   batch_first=True)
+    audio_padded  = nn.utils.rnn.pad_sequence(audio_list,  batch_first=True)
+    labels_padded = nn.utils.rnn.pad_sequence(label_list,  batch_first=True, padding_value=-1.0)
+    weights_padded= nn.utils.rnn.pad_sequence(weight_list, batch_first=True, padding_value=0.0)
+    return text_padded, audio_padded, labels_padded, weights_padded, lengths
 
 
 class StudentWindowDataset(Dataset):
@@ -217,7 +220,7 @@ class StudentWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self._items)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         item = self._items[idx]
         keyword_vec = torch.from_numpy(item["keyword_vec"])   # [128]
 
@@ -225,7 +228,8 @@ class StudentWindowDataset(Dataset):
         # Falls back to zeros for pre-MFCC cache files (old videos not yet backfilled).
         mfcc = torch.from_numpy(item["mfcc"])                 # [N_FRAMES, 13]
 
-        hard_label = torch.tensor(item["label"], dtype=torch.float32)
+        hard_label  = torch.tensor(item["label"],       dtype=torch.float32)
+        vote_weight = torch.tensor(item["vote_weight"], dtype=torch.float32)
 
         # Teacher soft label: logit from teacher inference (or fall back to hard label).
         key = self._keys[idx]
@@ -253,7 +257,7 @@ class StudentWindowDataset(Dataset):
             [w_idx / max(total - 1, 1)], dtype=torch.float32
         )  # [1]
 
-        return keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input
+        return keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input, vote_weight
 
 
 # ---------------------------------------------------------------------------
@@ -318,25 +322,35 @@ def _run_teacher_epoch(
     all_probs:  list[float] = []
 
     with torch.set_grad_enabled(train):
-        for text_emb, audio_emb, labels, lengths in loader:
+        for text_emb, audio_emb, labels, weights, lengths in loader:
             # text_emb  [B, T, 768]
             # audio_emb [B, T, 384]
-            # labels    [B, T]  (-1 for padded positions)
+            # labels    [B, T]  (-1 for padded or consistency-filtered positions)
+            # weights   [B, T]  vote-based per-window loss weights
             # lengths   [B]
             text_emb  = text_emb.to(device)
             audio_emb = audio_emb.to(device)
             labels    = labels.to(device)
+            weights   = weights.to(device)
             lengths   = lengths.to(device)
 
             logits = model(text_emb, audio_emb, lengths)  # [B, T, 1]
             logits = logits.squeeze(-1)                   # [B, T]
 
-            # Mask padded positions.
-            mask         = labels >= 0                    # [B, T]
-            logits_valid = logits[mask]                   # [N_valid]
-            labels_valid = labels[mask]                   # [N_valid]
+            # Mask excludes padding (-1) and isolated windows (-1 from consistency filter).
+            mask          = labels >= 0                   # [B, T]
+            logits_valid  = logits[mask]                  # [N_valid]
+            labels_valid  = labels[mask]                  # [N_valid]
+            weights_valid = weights[mask]                 # [N_valid]
 
-            loss = criterion(logits_valid, labels_valid)
+            # Per-sample BCE weighted by vote confidence.
+            pos_weight = criterion.pos_weight
+            loss_per   = F.binary_cross_entropy_with_logits(
+                logits_valid, labels_valid,
+                pos_weight=pos_weight.to(device) if pos_weight is not None else None,
+                reduction="none",
+            )
+            loss = (loss_per * weights_valid).mean()
 
             if train and optimizer is not None:
                 optimizer.zero_grad()
@@ -390,18 +404,21 @@ def _eval_teacher_with_thresholds(
     all_labels: list[int]   = []
 
     with torch.no_grad():
-        for text_emb, audio_emb, labels, lengths in loader:
+        for text_emb, audio_emb, labels, weights, lengths in loader:
             text_emb  = text_emb.to(device)
             audio_emb = audio_emb.to(device)
             labels    = labels.to(device)
+            weights   = weights.to(device)
             lengths   = lengths.to(device)
 
             logits = model(text_emb, audio_emb, lengths).squeeze(-1)
-            mask         = labels >= 0
-            logits_valid = logits[mask]
-            labels_valid = labels[mask]
+            mask          = labels >= 0
+            logits_valid  = logits[mask]
+            labels_valid  = labels[mask]
+            weights_valid = weights[mask]
 
-            loss = criterion(logits_valid, labels_valid)
+            loss_per   = F.binary_cross_entropy_with_logits(logits_valid, labels_valid, reduction="none")
+            loss       = (loss_per * weights_valid).mean()
             total_loss += loss.item() * mask.sum().item()
 
             probs = torch.sigmoid(logits_valid).cpu().tolist()
@@ -700,8 +717,9 @@ def kd_loss(
     temperature: float = 4.0,
     alpha: float = 0.7,
     focal: FocalLoss | None = None,
+    sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Combined knowledge distillation + focal loss.
+    """Combined knowledge distillation + focal loss with optional per-sample weighting.
 
     L = alpha * KL_div(student_soft, teacher_soft) + (1 - alpha) * focal(student, hard_label)
 
@@ -709,27 +727,35 @@ def kd_loss(
         student_logits:  [N] pre-sigmoid student output.
         teacher_logits:  [N] pre-sigmoid teacher output.
         hard_labels:     [N] binary hard labels.
-        temperature:     Softening temperature T (applied to both student and teacher logits).
+        temperature:     Softening temperature T.
         alpha:           Weight on the KD term vs. hard label term.
         focal:           FocalLoss instance; uses standard BCE if None.
+        sample_weights:  [N] per-sample weights in (0, 1].  Sponsor windows use
+                         vote-count-derived weights; non-sponsor windows use 1.0.
     """
-    # Soften both distributions.
-    T = temperature
-    student_soft = torch.sigmoid(student_logits / T)   # [N]
-    teacher_soft = torch.sigmoid(teacher_logits / T)   # [N]
+    T            = temperature
+    student_soft = torch.sigmoid(student_logits / T)
+    teacher_soft = torch.sigmoid(teacher_logits / T)
 
-    # KL divergence between Bernoulli distributions (binary case).
-    # KL(teacher || student) = sum(teacher * log(teacher/student))
     eps = 1e-7
     kl = teacher_soft * (torch.log(teacher_soft + eps) - torch.log(student_soft + eps)) \
        + (1 - teacher_soft) * (torch.log(1 - teacher_soft + eps) - torch.log(1 - student_soft + eps))
-    kl_loss = (T ** 2) * kl.mean()  # scale by T^2 to preserve gradient magnitude
 
-    # Hard label loss.
-    if focal is not None:
-        hard_loss = focal(student_logits, hard_labels)
+    if sample_weights is not None:
+        kl_loss = (T ** 2) * (kl * sample_weights).mean()
     else:
-        hard_loss = F.binary_cross_entropy_with_logits(student_logits, hard_labels)
+        kl_loss = (T ** 2) * kl.mean()
+
+    # Per-sample hard label loss so weights can be applied.
+    if focal is not None:
+        hard_per = F.binary_cross_entropy_with_logits(student_logits, hard_labels, reduction="none")
+        p_t      = torch.exp(-hard_per)
+        alpha_t  = hard_labels * focal.alpha + (1.0 - hard_labels) * (1.0 - focal.alpha)
+        hard_per = alpha_t * (1.0 - p_t) ** focal.gamma * hard_per
+    else:
+        hard_per = F.binary_cross_entropy_with_logits(student_logits, hard_labels, reduction="none")
+
+    hard_loss = (hard_per * sample_weights).mean() if sample_weights is not None else hard_per.mean()
 
     return alpha * kl_loss + (1.0 - alpha) * hard_loss
 
@@ -762,21 +788,29 @@ def _run_student_epoch(
     all_labels: list[int] = []
 
     with torch.set_grad_enabled(train):
-        for keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input in loader:
+        for keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input, vote_weight in loader:
             keyword_vec    = keyword_vec.to(device)     # [B, 128]
             mfcc           = mfcc.to(device)            # [B, N_FRAMES, 13]
             hard_label     = hard_label.to(device)      # [B]
             teacher_logit  = teacher_logit.to(device)   # [B]
             context_input  = context_input.to(device)   # [B, K_CONTEXT]
             position_input = position_input.to(device)  # [B, 1]
+            vote_weight    = vote_weight.to(device)     # [B]
 
-            student_logit = model(keyword_vec, mfcc, context_input, position_input).squeeze(-1)  # [B]
+            # Skip windows silenced by temporal consistency filtering (label=-1).
+            mask = hard_label >= 0
+            if mask.sum() == 0:
+                continue
+            student_logit = model(
+                keyword_vec[mask], mfcc[mask], context_input[mask], position_input[mask]
+            ).squeeze(-1)
 
             loss = kd_loss(
-                student_logit, teacher_logit, hard_label,
+                student_logit, teacher_logit[mask], hard_label[mask],
                 temperature=kd_temp,
                 alpha=kd_alpha,
                 focal=focal,
+                sample_weights=vote_weight[mask],
             )
 
             if train and optimizer is not None:

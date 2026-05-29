@@ -122,7 +122,11 @@ class TeacherSequenceDataset(Dataset):
     """Video-level sequence dataset for teacher training.
 
     Each item is a full video's ordered window sequence:
-        (text_embs [T, 768], audio_embs [T, 384], labels [T])
+        (text_embs [T, 768], audio_embs [T, 384], labels [T], weights [T])
+
+    Labels use -1 for padding and for windows silenced by temporal consistency
+    filtering (isolated sponsor windows).  Weights are per-window vote weights
+    in (0, 1] — non-sponsor windows and windows without vote data use 1.0.
     """
 
     def __init__(self, sponsor_ds: SponsorDataset) -> None:
@@ -134,31 +138,34 @@ class TeacherSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self._sequences)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         windows    = self._sequences[idx]
         text_embs  = torch.stack([torch.from_numpy(w["text_emb"])  for w in windows])
         audio_embs = torch.stack([torch.from_numpy(w["audio_emb"]) for w in windows])
-        labels     = torch.tensor([w["label"] for w in windows], dtype=torch.float32)
-        return text_embs, audio_embs, labels
+        labels     = torch.tensor([w["label"]       for w in windows], dtype=torch.float32)
+        weights    = torch.tensor([w["vote_weight"] for w in windows], dtype=torch.float32)
+        return text_embs, audio_embs, labels, weights
 
 
 def collate_teacher_sequences(
-    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pad variable-length video sequences to the longest one in the batch.
 
     Returns:
-        text_padded   [B, T_max, 768]
-        audio_padded  [B, T_max, 384]
-        labels_padded [B, T_max]  — padding positions marked -1.0
-        lengths       [B]
+        text_padded    [B, T_max, 768]
+        audio_padded   [B, T_max, 384]
+        labels_padded  [B, T_max]  — padding positions marked -1.0
+        weights_padded [B, T_max]  — padding positions get weight 0.0
+        lengths        [B]
     """
-    text_list, audio_list, label_list = zip(*batch)
-    lengths      = torch.tensor([t.shape[0] for t in text_list], dtype=torch.long)
-    text_padded  = nn.utils.rnn.pad_sequence(text_list,  batch_first=True)
-    audio_padded = nn.utils.rnn.pad_sequence(audio_list, batch_first=True)
-    labels_padded = nn.utils.rnn.pad_sequence(label_list, batch_first=True, padding_value=-1.0)
-    return text_padded, audio_padded, labels_padded, lengths
+    text_list, audio_list, label_list, weight_list = zip(*batch)
+    lengths       = torch.tensor([t.shape[0] for t in text_list], dtype=torch.long)
+    text_padded   = nn.utils.rnn.pad_sequence(text_list,   batch_first=True)
+    audio_padded  = nn.utils.rnn.pad_sequence(audio_list,  batch_first=True)
+    labels_padded = nn.utils.rnn.pad_sequence(label_list,  batch_first=True, padding_value=-1.0)
+    weights_padded= nn.utils.rnn.pad_sequence(weight_list, batch_first=True, padding_value=0.0)
+    return text_padded, audio_padded, labels_padded, weights_padded, lengths
 
 
 class StudentWindowDataset(Dataset):
@@ -189,11 +196,12 @@ class StudentWindowDataset(Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         item        = self._items[idx]
         keyword_vec = torch.from_numpy(item["keyword_vec"])
         mfcc        = torch.from_numpy(item["mfcc"])                # [N_FRAMES, 13]
         hard_label  = torch.tensor(item["label"], dtype=torch.float32)
+        vote_weight = torch.tensor(item["vote_weight"], dtype=torch.float32)
 
         key = self._keys[idx]
         vid, w_idx = key
@@ -211,7 +219,7 @@ class StudentWindowDataset(Dataset):
         total          = self._vid_total.get(vid, 1)
         position_input = torch.tensor([w_idx / max(total - 1, 1)], dtype=torch.float32)
 
-        return keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input
+        return keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input, vote_weight
 
 
 # ---------------------------------------------------------------------------
@@ -257,10 +265,17 @@ def kd_loss(
     temperature: float = 4.0,
     alpha: float = 0.7,
     focal: Optional[FocalLoss] = None,
+    sample_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Combined knowledge distillation + focal loss.
+    """Combined knowledge distillation + focal loss with optional per-sample weighting.
 
     L = alpha * KL(teacher_soft || student_soft) + (1 - alpha) * focal(student, hard)
+
+    Args:
+        sample_weights: float32 [N] per-sample weights in (0, 1].  When provided,
+                        each sample's contribution to the mean is scaled by its weight.
+                        Sponsor windows use vote-count-derived weights; non-sponsor
+                        windows default to 1.0.
     """
     T            = temperature
     student_soft = torch.sigmoid(student_logits / T)
@@ -270,9 +285,29 @@ def kd_loss(
         teacher_soft * (torch.log(teacher_soft + eps) - torch.log(student_soft + eps))
         + (1 - teacher_soft) * (torch.log(1 - teacher_soft + eps) - torch.log(1 - student_soft + eps))
     )
-    kl_loss = (T ** 2) * kl.mean()
-    hard_loss = focal(student_logits, hard_labels) if focal is not None \
-        else F.binary_cross_entropy_with_logits(student_logits, hard_labels)
+    if sample_weights is not None:
+        kl_loss = (T ** 2) * (kl * sample_weights).mean()
+    else:
+        kl_loss = (T ** 2) * kl.mean()
+
+    # Hard label loss — per-sample so weights can be applied.
+    if focal is not None:
+        hard_per = F.binary_cross_entropy_with_logits(
+            student_logits, hard_labels, reduction="none"
+        )
+        # Replicate focal weighting manually so we can apply sample_weights too.
+        p_t     = torch.exp(-hard_per)
+        alpha_t = hard_labels * focal.alpha + (1.0 - hard_labels) * (1.0 - focal.alpha)
+        hard_per = alpha_t * (1.0 - p_t) ** focal.gamma * hard_per
+    else:
+        hard_per = F.binary_cross_entropy_with_logits(
+            student_logits, hard_labels, reduction="none"
+        )
+    if sample_weights is not None:
+        hard_loss = (hard_per * sample_weights).mean()
+    else:
+        hard_loss = hard_per.mean()
+
     return alpha * kl_loss + (1.0 - alpha) * hard_loss
 
 
@@ -460,12 +495,23 @@ class TeacherLightningModule(L.LightningModule):
     def _shared_step(
         self, batch: tuple
     ) -> tuple[torch.Tensor, list[float], list[int]]:
-        text_emb, audio_emb, labels, lengths = batch
+        text_emb, audio_emb, labels, weights, lengths = batch
         logits        = self.model(text_emb, audio_emb, lengths).squeeze(-1)
+        # mask excludes both padding (-1 from collate) and isolated windows (-1 from consistency filter)
         mask          = labels >= 0
         logits_valid  = logits[mask]
         labels_valid  = labels[mask]
-        loss          = self.criterion(logits_valid, labels_valid)
+        weights_valid = weights[mask]
+
+        # Per-sample BCE weighted by vote confidence.
+        pos_weight    = self.criterion.pos_weight
+        loss_per      = F.binary_cross_entropy_with_logits(
+            logits_valid, labels_valid,
+            pos_weight=pos_weight.to(logits_valid.device) if pos_weight is not None else None,
+            reduction="none",
+        )
+        loss          = (loss_per * weights_valid).mean()
+
         probs         = torch.sigmoid(logits_valid).detach().cpu().tolist()
         labels_list   = labels_valid.long().cpu().tolist()
         return loss, probs, labels_list
@@ -616,16 +662,24 @@ class StudentLightningModule(L.LightningModule):
     def _shared_step(
         self, batch: tuple
     ) -> tuple[torch.Tensor, list[float], list[int]]:
-        keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input = batch
-        student_logit = self.model(keyword_vec, mfcc, context_input, position_input).squeeze(-1)
-        loss   = kd_loss(
-            student_logit, teacher_logit, hard_label,
-            temperature = self.kd_temp,
-            alpha       = self.kd_alpha,
-            focal       = self.focal,
+        keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input, vote_weight = batch
+        # Skip windows silenced by temporal consistency filtering (label=-1).
+        mask           = hard_label >= 0
+        if mask.sum() == 0:
+            dummy = torch.tensor(0.0, requires_grad=True, device=hard_label.device)
+            return dummy, [], []
+        student_logit  = self.model(
+            keyword_vec[mask], mfcc[mask], context_input[mask], position_input[mask]
+        ).squeeze(-1)
+        loss = kd_loss(
+            student_logit, teacher_logit[mask], hard_label[mask],
+            temperature    = self.kd_temp,
+            alpha          = self.kd_alpha,
+            focal          = self.focal,
+            sample_weights = vote_weight[mask],
         )
         probs  = torch.sigmoid(student_logit).detach().cpu().tolist()
-        labels = hard_label.long().cpu().tolist()
+        labels = hard_label[mask].long().cpu().tolist()
         return loss, probs, labels
 
     # ── Training ──────────────────────────────────────────────────────────

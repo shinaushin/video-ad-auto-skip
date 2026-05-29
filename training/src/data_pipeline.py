@@ -69,6 +69,10 @@ MFCC_FPS = 1
 #: Number of MFCC frames buffered for the CNN audio branch.
 N_MFCC_FRAMES = 30
 
+#: Sponsor segments with this many votes or more get full loss weight (1.0).
+#: Segments below this are downweighted proportionally.
+VOTE_WEIGHT_CAP = 10
+
 #: Whisper-tiny encoder hidden size.
 WHISPER_DIM = 384
 
@@ -1089,16 +1093,19 @@ class SponsorDataset:
         audio_emb    float32 [WHISPER_DIM]              (from Whisper mean-pool)
         text_emb     float32 [DISTILBERT_DIM]
         mfcc         float32 [N_MFCC_FRAMES, MFCC_DIM]  (zeros for pre-MFCC cache files)
-        label        int8 scalar
+        label        int8 scalar  (-1 = ignored by loss, used for isolated windows)
+        vote_weight  float32      per-window loss weight in (0, 1] based on SB vote count
         video_id     str
 
     Args:
         min_votes: If > 0 and the npz contains ``sponsor_segs`` / ``sponsor_seg_votes``
-                   arrays (written by data_pipeline.py), window labels are recomputed
-                   from scratch using only segments whose vote count ≥ min_votes.
-                   This lets you change the quality threshold without re-running the
-                   embedding pipeline.  Falls back to stored labels for files that
+                   arrays, window labels are recomputed using only segments with
+                   vote count ≥ min_votes.  Falls back to stored labels for files that
                    pre-date the vote arrays (backward-compatible).
+        temporal_consistency: If True, isolated sponsor windows (label=1 with no
+                   sponsor neighbor on either side) are set to label=-1 so the loss
+                   ignores them.  These are almost always boundary artefacts or
+                   mislabels — real sponsor reads span ≥ 2 consecutive windows.
     """
 
     def __init__(
@@ -1108,11 +1115,13 @@ class SponsorDataset:
         require_audio: bool = True,
         require_text: bool = True,
         min_votes: int = 0,
+        temporal_consistency: bool = True,
     ) -> None:
         self.cache_dir = cache_dir
         self.require_audio = require_audio
         self.require_text = require_text
         self.min_votes = min_votes
+        self.temporal_consistency = temporal_consistency
 
         if video_ids is not None:
             self.video_ids = video_ids
@@ -1123,8 +1132,15 @@ class SponsorDataset:
         self._index: list[tuple[str, int]] = []
         # Per-video recomputed label arrays (only populated when min_votes > 0).
         self._recomputed_labels: dict[str, np.ndarray] = {}
+        # Per-video consistency-filtered labels (isolated sponsors set to -1).
+        self._consistency_labels: dict[str, np.ndarray] = {}
+        # Per-video per-window vote weights in (0, 1].
+        self._vote_weights: dict[str, np.ndarray] = {}
+
         skipped_audio = 0
-        n_recomputed = 0
+        n_recomputed  = 0
+        n_isolated    = 0
+
         for vid in self.video_ids:
             path = cache_dir / f"{vid}.npz"
             if not path.exists():
@@ -1137,7 +1153,7 @@ class SponsorDataset:
                 continue
             n = len(data["labels"])
 
-            # Re-label windows from stored vote data if requested.
+            # ── Re-label windows from stored vote data if requested ───────
             if min_votes > 0 and "sponsor_segs" in data.files and "sponsor_seg_votes" in data.files:
                 recomputed = self._recompute_labels(
                     window_bounds=data["segments"],
@@ -1148,18 +1164,46 @@ class SponsorDataset:
                 self._recomputed_labels[vid] = recomputed
                 n_recomputed += 1
 
+            # Effective labels used for both consistency filtering and vote weights.
+            effective_labels = self._recomputed_labels.get(vid, data["labels"])
+
+            # ── Temporal consistency filtering ────────────────────────────
+            # Isolated sponsor windows (no sponsor neighbour) → label=-1 (ignored).
+            if temporal_consistency and len(effective_labels) > 1:
+                filtered, n_vid_isolated = self._apply_temporal_consistency(effective_labels)
+                if n_vid_isolated > 0:
+                    self._consistency_labels[vid] = filtered
+                    n_isolated += n_vid_isolated
+
+            # ── Vote-based loss weights ───────────────────────────────────
+            # Sponsor windows: weight = min(1.0, max_votes / VOTE_WEIGHT_CAP)
+            # Non-sponsor windows: weight = 1.0 (absence of label is reliable)
+            if "sponsor_segs" in data.files and "sponsor_seg_votes" in data.files:
+                self._vote_weights[vid] = self._compute_vote_weights(
+                    window_bounds=data["segments"],
+                    labels=effective_labels,
+                    sponsor_segs=data["sponsor_segs"],
+                    sponsor_seg_votes=data["sponsor_seg_votes"],
+                )
+
             self._index.extend((vid, i) for i in range(n))
 
+        n_videos = len(self.video_ids) - skipped_audio
         if skipped_audio:
             log.info("SponsorDataset: skipped %d videos with all-zero audio embeddings", skipped_audio)
         if min_votes > 0:
             log.info(
                 "SponsorDataset: recomputed labels for %d/%d videos (min_votes=%d); "
                 "%d videos used stored labels (pre-date vote arrays)",
-                n_recomputed, len(self.video_ids) - skipped_audio,
-                min_votes, len(self.video_ids) - skipped_audio - n_recomputed,
+                n_recomputed, n_videos, min_votes, n_videos - n_recomputed,
             )
-        log.info("SponsorDataset: %d windows across %d videos", len(self._index), len(self.video_ids) - skipped_audio)
+        if temporal_consistency and n_isolated > 0:
+            log.info(
+                "SponsorDataset: temporal consistency — ignored %d isolated sponsor windows "
+                "across %d videos (set to label=-1; not included in loss)",
+                n_isolated, len(self._consistency_labels),
+            )
+        log.info("SponsorDataset: %d windows across %d videos", len(self._index), n_videos)
 
     @staticmethod
     def _recompute_labels(
@@ -1195,6 +1239,68 @@ class SponsorDataset:
                     break
         return labels
 
+    @staticmethod
+    def _apply_temporal_consistency(
+        labels: np.ndarray,
+    ) -> tuple[np.ndarray, int]:
+        """Set isolated sponsor windows to -1 (ignored by the loss).
+
+        A window is "isolated" if it is labelled sponsor (1) but has no
+        sponsor-labelled neighbour on either side.  Real sponsor reads span
+        ≥ 2 consecutive 5-second windows (≥ 10 s); single windows are almost
+        always boundary artefacts or mislabels.
+
+        Returns:
+            filtered    int8 [N]  label array with isolated windows set to -1.
+            n_isolated  int       number of windows that were silenced.
+        """
+        result     = labels.copy().astype(np.int8)
+        n          = len(result)
+        n_isolated = 0
+        for i in range(n):
+            if labels[i] != 1:
+                continue
+            has_sponsor_prev = (i > 0     and labels[i - 1] == 1)
+            has_sponsor_next = (i < n - 1 and labels[i + 1] == 1)
+            if not has_sponsor_prev and not has_sponsor_next:
+                result[i] = -1
+                n_isolated += 1
+        return result, n_isolated
+
+    @staticmethod
+    def _compute_vote_weights(
+        window_bounds: np.ndarray,
+        labels: np.ndarray,
+        sponsor_segs: np.ndarray,
+        sponsor_seg_votes: np.ndarray,
+    ) -> np.ndarray:
+        """Per-window loss weight based on SponsorBlock vote count.
+
+        Non-sponsor windows (label=0):  weight = 1.0  (absence is reliable)
+        Sponsor windows     (label=1):  weight = min(1.0, max_votes / VOTE_WEIGHT_CAP)
+
+        A segment with ≥ VOTE_WEIGHT_CAP votes gets full weight; one with
+        fewer votes is downweighted proportionally so it contributes less to
+        the gradient without being discarded entirely.
+        """
+        weights = np.ones(len(window_bounds), dtype=np.float32)
+        for i, (t_start, t_end) in enumerate(window_bounds):
+            if labels[i] != 1:
+                continue
+            window_len = float(t_end - t_start)
+            if window_len <= 0:
+                continue
+            max_votes = 0
+            for j, (s_start, s_end) in enumerate(sponsor_segs):
+                overlap = max(
+                    0.0,
+                    min(float(t_end), float(s_end)) - max(float(t_start), float(s_start)),
+                )
+                if overlap / window_len >= 0.5:
+                    max_votes = max(max_votes, int(sponsor_seg_votes[j]))
+            weights[i] = min(1.0, max_votes / max(VOTE_WEIGHT_CAP, 1))
+        return weights
+
     def __len__(self) -> int:
         return len(self._index)
 
@@ -1214,24 +1320,33 @@ class SponsorDataset:
             # Pad old 64-dim cache files to 128-dim (new dims fire as 0 for old videos).
             if kw.shape[0] < 128:
                 kw = np.concatenate([kw, np.zeros(128 - kw.shape[0], dtype=np.float32)])
-            # Use recomputed labels when min_votes > 0 and vote data was available.
-            if vid in self._recomputed_labels:
+
+            # Label priority: consistency-filtered > min_votes-recomputed > stored.
+            if vid in self._consistency_labels:
+                label = int(self._consistency_labels[vid][idx])
+            elif vid in self._recomputed_labels:
                 label = int(self._recomputed_labels[vid][idx])
             else:
                 label = int(data["labels"][idx])
+
+            # Vote-based loss weight: 1.0 for non-sponsor or when vote data unavailable.
+            vote_weight = float(self._vote_weights[vid][idx]) if vid in self._vote_weights else 1.0
+
             # Real MFCC features — zeros for old cache files that pre-date
             # compute_mfcc_features() (backfill with backfill_mfcc.py).
             if "mfcc_features" in data:
-                mfcc = data["mfcc_features"][idx].astype(np.float32)  # [N_MFCC_FRAMES, MFCC_DIM]
+                mfcc = data["mfcc_features"][idx].astype(np.float32)
             else:
                 mfcc = np.zeros((N_MFCC_FRAMES, MFCC_DIM), dtype=np.float32)
+
             yield {
                 "keyword_vec": kw,
-                "audio_emb": data["audio_embs"][idx].astype(np.float32),
-                "text_emb": data["text_embs"][idx].astype(np.float32),
-                "mfcc": mfcc,
-                "label": label,
-                "video_id": vid,
+                "audio_emb":   data["audio_embs"][idx].astype(np.float32),
+                "text_emb":    data["text_embs"][idx].astype(np.float32),
+                "mfcc":        mfcc,
+                "label":       label,
+                "vote_weight": vote_weight,
+                "video_id":    vid,
             }
 
     @staticmethod
