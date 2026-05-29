@@ -8,6 +8,10 @@ librosa>=0.10.0
 tqdm>=4.66.0
 numpy>=1.24.0
 
+# PyTorch Lightning + Hydra (Phase A/B pipeline modernization)
+lightning>=2.2.0
+hydra-core>=1.3.0
+
 # Hyperparameter search
 optuna>=3.4.0
 

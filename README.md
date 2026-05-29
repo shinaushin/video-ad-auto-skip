@@ -112,6 +112,108 @@ Results are saved to `benchmark-results.json` for further analysis.
 
 ---
 
+## Training Pipeline (`training/`)
+
+The ML model is trained in four phases: data collection → teacher training → knowledge distillation → ONNX export. Two entry points exist: the legacy `train.py` (still works, used by existing Vertex submit scripts) and the new `train_lightning.py` (PyTorch Lightning + Hydra, recommended going forward).
+
+### Data
+
+```bash
+# Collect embeddings for videos in sponsorTimes.csv (runs locally on Mac)
+python3 training/src/data_pipeline.py \
+  --csv training/outputs/data/sponsorTimes.csv \
+  --out training/cache/embeddings \
+  --videos 999999 \
+  --device mps \
+  --cookies-from-browser chrome \
+  --sleep 2
+
+# Backfill real MFCC features into existing cache files (no re-download)
+python3 training/src/data_pipeline.py \
+  --out training/cache/embeddings \
+  --mfcc-only \
+  --cookies-from-browser chrome \
+  --sleep 2 \
+  --workers 1
+
+# Sync local cache to GCS
+gsutil -m rsync -r training/cache/embeddings gs://yt-sponsor-cache/embeddings
+```
+
+### Training — Lightning + Hydra (recommended)
+
+Run from `training/src/`. Config lives in `training/conf/`.
+
+```bash
+cd training/src
+
+# Teacher training (all defaults from conf/training/teacher.yaml)
+python train_lightning.py
+
+# Student distillation
+python train_lightning.py phase=distill \
+  training.teacher_ckpt=/tmp/outputs/teacher/teacher_best.pt
+
+# Quick 1-batch smoke test (catches shape/type errors instantly, no full fit)
+python train_lightning.py +trainer.fast_dev_run=true
+python train_lightning.py phase=distill +trainer.fast_dev_run=true
+
+# Override individual hyperparameters inline
+python train_lightning.py training.lr=5e-5 model.dropout=0.3
+
+# Hyperparameter sweep — replaces tune.py + submit_tune.sh
+python train_lightning.py --multirun \
+  training.lr=1e-4,2e-4,5e-4 \
+  model.dropout=0.1,0.25
+
+# On Vertex AI — pass GCS paths as overrides
+python train_lightning.py \
+  gcs.input=gs://yt-sponsor-cache/embeddings \
+  gcs.output=gs://yt-sponsor-cache/outputs/run1
+```
+
+TensorBoard logs land at `<output_dir>/<phase>/tb/<job_name>/`. Point TensorBoard at the `tb/` parent to compare runs:
+
+```bash
+tensorboard --logdir /tmp/outputs/teacher/tb
+# or against GCS:
+tensorboard --logdir gs://yt-sponsor-cache/outputs/tb
+```
+
+### Training — Legacy (`train.py` + submit scripts)
+
+Still works; used by the existing Vertex submit scripts.
+
+```bash
+# Teacher
+bash training/scripts/submit_train.sh
+
+# Distillation
+bash training/scripts/submit_distill.sh
+
+# Eval (teacher)
+bash training/scripts/submit_eval_teacher.sh
+
+# Eval (student)
+bash training/scripts/submit_eval_student.sh
+```
+
+### Export
+
+```bash
+# Export student checkpoint to ONNX, then copy into the Chrome extension
+bash training/scripts/submit_export.sh
+
+# Or run locally
+python3 training/src/export_onnx.py \
+  --ckpt /tmp/outputs/distill/student_best.pt \
+  --out youtube-ml-sponsor-detector/model.onnx
+```
+
+After exporting, reload the Chrome extension (`chrome://extensions`) to pick up the new model.
+
+---
+
 ## Installation
 
 Both extensions use Chrome's Manifest V3 and are loaded as unpacked extensions:
