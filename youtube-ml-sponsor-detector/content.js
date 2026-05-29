@@ -335,6 +335,8 @@
         consecutiveFrames = Math.max(0, consecutiveFrames - 1);
       }
 
+      console.debug(`[ML Detector] t=${t.toFixed(1)}s ml=${mlScore.toFixed(3)} audio=${audioAnomaly.toFixed(3)} blended=${blendedScore.toFixed(3)} consec=${consecutiveFrames}`);
+
       const shouldEnter = consecutiveFrames >= MLSponsorDetector.MIN_CONSECUTIVE_FRAMES;
       const shouldExit  = blendedScore < MLSponsorDetector.EXIT_THRESHOLD
                           && consecutiveFrames === 0;
