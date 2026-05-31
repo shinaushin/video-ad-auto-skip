@@ -62,6 +62,23 @@ try:
 except ImportError:
     _HAS_GCP_UTILS = False
 
+
+class GCSTensorBoardSync(L.Callback):
+    """Upload TensorBoard logs to GCS after every validation epoch.
+
+    This replicates the per-epoch upload that train.py does so TensorBoard
+    is viewable in real time while the job is still running on Vertex AI.
+    Without this, logs only appear in GCS after the entire job completes.
+    """
+
+    def __init__(self, local_tb_dir: str, gcs_tb_dir: str) -> None:
+        self.local_tb_dir = local_tb_dir
+        self.gcs_tb_dir   = gcs_tb_dir
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        if _HAS_GCP_UTILS:
+            upload_to_gcs(self.local_tb_dir, self.gcs_tb_dir)
+
 from lightning_modules import (
     StudentDataModule,
     StudentLightningModule,
@@ -115,6 +132,9 @@ def main(cfg: DictConfig) -> None:
     # ModelCheckpoint saves the best model by val/f1.
     # EarlyStopping stops when val/f1 stops improving.
     # LearningRateMonitor writes lr to TensorBoard each epoch.
+    # GCSTensorBoardSync uploads TB logs to GCS after each val epoch so
+    # TensorBoard is viewable in real time on Vertex AI (not just after job ends).
+    local_tb_dir = str(output_dir / "tb" / cfg.get("job_name", "run"))
     ckpt_filename = f"{cfg.phase}_best-{{epoch:02d}}-{{val_f1:.3f}}"
     callbacks = [
         ModelCheckpoint(
@@ -133,6 +153,16 @@ def main(cfg: DictConfig) -> None:
         ),
         LearningRateMonitor(logging_interval="epoch"),
     ]
+
+    gcs_output = cfg.get("gcs", {}).get("output") or os.environ.get("AIP_MODEL_DIR", "")
+    if gcs_output and _HAS_GCP_UTILS:
+        callbacks.append(
+            GCSTensorBoardSync(
+                local_tb_dir = local_tb_dir,
+                gcs_tb_dir   = f"{gcs_output}/tb",
+            )
+        )
+        log.info("GCS TensorBoard sync enabled → %s/tb", gcs_output)
 
     # ── Trainer ───────────────────────────────────────────────────────────
     # Extra Trainer kwargs can be injected via Hydra CLI:
@@ -188,8 +218,7 @@ def main(cfg: DictConfig) -> None:
             f"Unknown phase: {cfg.phase!r}. Expected: teacher | distill | baseline"
         )
 
-    # ── GCS: upload results ───────────────────────────────────────────────
-    gcs_output = cfg.get("gcs", {}).get("output") or os.environ.get("AIP_MODEL_DIR", "")
+    # ── GCS: upload final results ─────────────────────────────────────────
     if gcs_output and _HAS_GCP_UTILS:
         log.info("Uploading outputs: %s → %s", output_dir, gcs_output)
         upload_to_gcs(str(output_dir), gcs_output)
