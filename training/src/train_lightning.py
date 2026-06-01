@@ -135,7 +135,7 @@ def main(cfg: DictConfig) -> None:
     # GCSTensorBoardSync uploads TB logs to GCS after each val epoch so
     # TensorBoard is viewable in real time on Vertex AI (not just after job ends).
     local_tb_dir = str(output_dir / "tb" / cfg.get("job_name", "run"))
-    ckpt_filename = f"{cfg.phase}_best-{{epoch:02d}}-{{val_f1:.3f}}"
+    ckpt_filename = f"{cfg.phase}_best-{{epoch:02d}}-{{val/f1:.3f}}"
     callbacks = [
         ModelCheckpoint(
             dirpath   = str(output_dir),
