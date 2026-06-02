@@ -7,4 +7,4 @@ lstm_layers:     3      # Number of stacked BiLSTM layers
 dropout:         0.25   # Dropout in classifier head
 embed_mode:      both   # both | text_only | audio_only
 arch_variant:    v1     # v1 (single cross-attn) | v2 (stacked) | v3 (FFN blocks)
-pos_weight_mult: 1.87   # BCEWithLogitsLoss pos_weight multiplier
+pos_weight_mult: 2.0   # BCEWithLogitsLoss pos_weight multiplier
