@@ -1,17 +1,38 @@
 # @package _global_.training
-# Student distillation hyperparameters — matches phase4_distill.json.
+# Student distillation hyperparameters.
 #
 # KD loss: alpha * KL(teacher_soft || student_soft) + (1-alpha) * focal(student, hard)
-# Baseline (surrogate MFCC, no KD): F1=0.48
-# Current target: retrain with real MFCC + KD re-enabled
+#
+# ── Student F1 history ────────────────────────────────────────────────────────
+# Baseline (surrogate MFCC, no KD):                        F1 = 0.48
+# Real MFCC + KD re-enabled (kd_alpha=0.4, T=3.0):        F1 = 0.52  ← ceiling
+#
+# ── Why the student is limited to ~0.52 ──────────────────────────────────────
+# The student's input features (128-dim sparse binary keyword indicators +
+# 13-dim MFCC) are fundamentally weaker than the teacher's (DistilBERT 768-dim
+# semantic embeddings + Whisper 384-dim audio encoder).  The teacher reaches
+# F1=0.82 largely through DistilBERT's semantic understanding of sponsor
+# language — the student cannot replicate this from keyword regex matches alone.
+#
+# Hyperparameter tuning (Optuna, 20 trials) and architectural improvements
+# (K_CONTEXT 3→10, ContextGRU, vote-weighted loss, temporal consistency
+# filtering) were all explored.  The ceiling did not move past ~0.52.
+#
+# ── Decision ─────────────────────────────────────────────────────────────────
+# F1=0.52 is insufficient for a good user experience. The browser-side
+# inference constraint has been relaxed. The teacher model is now deployed as
+# a Cloud Run backend (backend/) that pre-computes sponsor segments per video
+# using the full DistilBERT + Whisper + BiLSTM pipeline (F1=0.82).
+# The extension calls the backend on page load and falls back to the in-browser
+# student model if the backend is unavailable.
 
-lr:              2.0e-4
+lr:              1.0e-4
 weight_decay:    1.0e-4
 epochs:          60
 patience:        10      # EarlyStopping patience (val/f1, mode=max)
 batch_size:      64
-kd_temperature:  3.0    # Softening temperature T (higher = softer teacher labels)
-kd_alpha:        0.4    # Weight on KD loss vs hard label loss
+kd_temperature:  1.5    # Softening temperature T (higher = softer teacher labels)
+kd_alpha:        1.0    # Weight on KD loss vs hard label loss
 focal_gamma:     2.0    # Focal loss focusing exponent (0 = standard BCE)
 focal_alpha:     0.5    # Focal loss positive class weight
 min_votes:       0
