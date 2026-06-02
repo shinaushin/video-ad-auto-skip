@@ -58,7 +58,7 @@ class MLSponsorDetector {
   static TEXT_DIM   = 128;  // KeywordFeatureExtractor.FEATURE_DIM
   static MFCC_DIM   = 13;   // MFCCExtractor.NUM_COEFFICIENTS — one frame
   static N_FRAMES   = 30;   // MFCCExtractor.N_FRAMES — CNN input length
-  static K_CONTEXT  = 3;    // rolling window of last K sigmoid predictions
+  static K_CONTEXT  = 10;   // rolling window of last K sigmoid predictions
   static HIDDEN1    = 32;
   static HIDDEN2    = 16;
   // INPUT_DIM for heuristic MLP (text + mean MFCC; context/position excluded).

@@ -45,8 +45,8 @@ MFCC_DIM = 13
 #: Number of buffered MFCC frames for the CNN (must match N_MFCC_FRAMES in extension).
 N_FRAMES = 30
 
-#: Number of previous window predictions fed as context to the student fusion MLP.
-K_CONTEXT = 3
+#: Number of previous window predictions fed as context to the student GRU.
+K_CONTEXT = 10
 
 #: DistilBERT hidden size.
 DISTILBERT_DIM = 768
@@ -418,18 +418,50 @@ class MFCCConvBranch(nn.Module):
         return self.proj(x)                 # → [batch, out_dim]
 
 
+class ContextGRU(nn.Module):
+    """Small GRU over the last K_CONTEXT previous window predictions.
+
+    Replaces the flat concatenation of K_CONTEXT scalars with a learned
+    sequential encoding.  The GRU can detect patterns like:
+      - "scores have been rising for 5 consecutive windows → entering sponsor"
+      - "scores are high then suddenly drop → sponsor just ended"
+
+    Input:  float32 [batch, K_CONTEXT]  previous sigmoid scores (oldest → newest)
+    Output: float32 [batch, hidden_dim] temporal context embedding
+    """
+
+    HIDDEN_DIM = 16
+
+    def __init__(self, k_context: int = K_CONTEXT) -> None:
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size  = 1,
+            hidden_size = self.HIDDEN_DIM,
+            num_layers  = 1,
+            batch_first = True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, K_CONTEXT]  →  unsqueeze to [batch, K_CONTEXT, 1] for GRU
+        _, h_n = self.gru(x.unsqueeze(-1))   # h_n: [1, batch, HIDDEN_DIM]
+        return h_n.squeeze(0)                 # [batch, HIDDEN_DIM]
+
+
 class StudentModel(nn.Module):
     """Lightweight student model — designed for ONNX Runtime Web inference.
 
-    Accepts the same two-input interface that feature-extractor.js provides:
-        text_input   float32 [batch, 64]          keyword indicator vector
-        audio_input  float32 [batch, N_FRAMES, 13] MFCC frame sequence
+    Accepts the same four-input interface that feature-extractor.js provides:
+        text_input      float32 [batch, TEXT_DIM]          keyword indicator vector
+        audio_input     float32 [batch, N_FRAMES, MFCC_DIM] MFCC frame sequence
+        context_input   float32 [batch, K_CONTEXT]          last K sigmoid outputs
+        position_input  float32 [batch, 1]                  relative window position
 
     Architecture:
-        text_branch  → [batch, 32]
-        audio_branch → [batch, 32]
-        concat       → [batch, 64]
-        fusion MLP:  Linear(64→32) → ReLU → Linear(32→16) → ReLU → Linear(16→1)
+        text_branch   → [batch, 32]               keyword linear projection
+        audio_branch  → [batch, 32]               MFCC 1-D CNN
+        context_gru   → [batch, 16]               GRU over K_CONTEXT previous scores
+        fusion MLP:   Linear(81→64) → ReLU → Linear(64→32) → ReLU → Linear(32→1)
+                      (81 = 32 text + 32 audio + 16 context GRU + 1 position)
 
     Output:
         logits   float32 [batch, 1]   (pre-sigmoid — apply sigmoid at inference time)
@@ -437,10 +469,11 @@ class StudentModel(nn.Module):
 
     def __init__(self, dropout: float = 0.2) -> None:
         super().__init__()
-        self.text_branch = KeywordTextBranch(TEXT_DIM, 32)
+        self.text_branch  = KeywordTextBranch(TEXT_DIM, 32)
         self.audio_branch = MFCCConvBranch(MFCC_DIM, 32)
-        # Fusion MLP input: 32 (text) + 32 (audio) + K_CONTEXT (context) + 1 (position) = 68
-        fusion_in = 32 + 32 + K_CONTEXT + 1
+        self.context_gru  = ContextGRU(K_CONTEXT)
+        # Fusion MLP input: 32 (text) + 32 (audio) + 16 (GRU) + 1 (position) = 81
+        fusion_in = 32 + 32 + ContextGRU.HIDDEN_DIM + 1
         self.fusion = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(fusion_in, 64),
@@ -468,12 +501,13 @@ class StudentModel(nn.Module):
         Returns:
             logits [batch, 1]
         """
-        text_feat  = self.text_branch(text_input)    # [batch, 32]
-        audio_feat = self.audio_branch(audio_input)  # [batch, 32]
-        combined   = torch.cat(
-            [text_feat, audio_feat, context_input, position_input], dim=-1
-        )                                            # [batch, 68]
-        return self.fusion(combined)                 # [batch, 1]
+        text_feat    = self.text_branch(text_input)     # [batch, 32]
+        audio_feat   = self.audio_branch(audio_input)  # [batch, 32]
+        context_feat = self.context_gru(context_input) # [batch, 16]
+        combined     = torch.cat(
+            [text_feat, audio_feat, context_feat, position_input], dim=-1
+        )                                              # [batch, 81]
+        return self.fusion(combined)                   # [batch, 1]
 
     def predict_proba(
         self,
