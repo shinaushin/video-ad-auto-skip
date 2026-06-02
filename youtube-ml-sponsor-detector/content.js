@@ -65,6 +65,19 @@
    */
   const SEEK_BUFFER     = 1.0;
 
+  /**
+   * Backend API URL for pre-computed bimodal predictions.
+   * Update this after running backend/deploy.sh.
+   * Set to null to disable backend integration and use in-browser model only.
+   */
+  const BACKEND_URL     = null;   // e.g. "https://yt-sponsor-predict-xxxxx.run.app"
+
+  /** How often to poll the backend for a pending job result (ms). */
+  const BACKEND_POLL_MS = 2000;
+
+  /** Max time to wait for a backend result before giving up (ms). */
+  const BACKEND_TIMEOUT_MS = 120_000;
+
   /** Poll interval for Stage 2 (ms). One MFCC frame + one inference call. */
   const POLL_MS         = 1000;
 
@@ -545,7 +558,14 @@
     // Wait for YouTube's player config object to be available on SPA navigation
     await delay(1500);
 
-    // ── Stage 1: Caption pre-detection ────────────────────────────────────
+    // ── Backend + Stage 1 run in parallel ─────────────────────────────────
+    // Backend: full bimodal teacher (DistilBERT + Whisper + BiLSTM, F1~0.82).
+    // Stage 1: lightweight caption keyword pre-detection (in-browser fallback).
+    // Backend results take priority; Stage 1 fills in until backend responds.
+
+    const backendPromise = fetchFromBackend(videoId);   // non-blocking
+
+    // ── Stage 1: Caption pre-detection (in-browser) ───────────────────────
     const captionUrl = getCaptionTrackUrl();
     if (captionUrl) {
       captionCues = await fetchCaptions(captionUrl);
@@ -570,8 +590,131 @@
       console.log("[ML Detector] Stage 1: no captions available — running audio-only in Stage 2.");
     }
 
-    // ── Stage 2: Real-time bimodal polling (always runs) ─────────────────
+    // ── Stage 2: Real-time bimodal polling (always runs) ──────────────────
     startPolling();
+
+    // ── Await backend result and upgrade predetectedSegments ──────────────
+    // This runs concurrently with Stage 2 polling. When the backend responds,
+    // its higher-quality segments replace the Stage 1 results. Stage 2 polling
+    // immediately benefits since it reads predetectedSegments on every tick.
+    backendPromise.then(rawSegments => {
+      if (!rawSegments || videoId !== currentVideoId) return;
+      predetectedSegments = _backendSegmentsToPredetected(rawSegments);
+      console.log(
+        `[ML Detector] Backend segments loaded — ${predetectedSegments.length} segment(s): `,
+        predetectedSegments.map(s =>
+          `${formatTime(s.start)}→${formatTime(s.end)} (score ${s.score.toFixed(2)})`
+        ).join(", ")
+      );
+    });
+  }
+
+  // ─── Backend prediction (bimodal teacher via Cloud Run) ──────────────────
+
+  /**
+   * Fetch pre-computed sponsor segments from the backend API.
+   * Uses an async job pattern: POST /predict → poll GET /result/{job_id}.
+   *
+   * Falls back gracefully (returns null) if:
+   *   - BACKEND_URL is not configured
+   *   - Network request fails
+   *   - Backend times out after BACKEND_TIMEOUT_MS
+   *
+   * @param {string} videoId
+   * @returns {Promise<Array<{start,end,score}>|null>}
+   */
+  async function fetchFromBackend(videoId) {
+    if (!BACKEND_URL) return null;
+
+    try {
+      const resp = await fetch(`${BACKEND_URL}/predict`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ video_id: videoId }),
+      });
+
+      if (!resp.ok) {
+        console.warn(`[ML Detector] Backend /predict returned ${resp.status}`);
+        return null;
+      }
+
+      const data = await resp.json();
+
+      // Cache hit — result returned immediately.
+      if (data.status === "complete") {
+        console.log(
+          `[ML Detector] Backend cache hit — ${data.segments.length} segment(s)`
+        );
+        return data.segments;
+      }
+
+      // Job queued — poll until complete or timeout.
+      if (data.status === "pending" && data.job_id) {
+        return await _pollBackendResult(data.job_id);
+      }
+
+      return null;
+    } catch (e) {
+      console.warn("[ML Detector] Backend unavailable:", e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Poll GET /result/{job_id} every BACKEND_POLL_MS until complete or timeout.
+   * @returns {Promise<Array|null>}
+   */
+  async function _pollBackendResult(jobId) {
+    const deadline = Date.now() + BACKEND_TIMEOUT_MS;
+    let   attempts = 0;
+
+    while (Date.now() < deadline) {
+      await delay(BACKEND_POLL_MS);
+      attempts++;
+
+      try {
+        const resp = await fetch(`${BACKEND_URL}/result/${jobId}`);
+        if (!resp.ok) continue;
+
+        const data = await resp.json();
+
+        if (data.status === "complete") {
+          console.log(
+            `[ML Detector] Backend result ready after ${attempts} poll(s) — ` +
+            `${data.segments.length} segment(s)`
+          );
+          return data.segments;
+        }
+
+        if (data.status === "failed") {
+          console.warn("[ML Detector] Backend job failed:", data.error);
+          return null;
+        }
+
+        // Still pending — log progress every 10 polls (~20s).
+        if (attempts % 10 === 0) {
+          console.log(`[ML Detector] Backend still processing… (${attempts * BACKEND_POLL_MS / 1000}s)`);
+        }
+      } catch (e) {
+        console.warn("[ML Detector] Backend poll error:", e.message);
+      }
+    }
+
+    console.warn("[ML Detector] Backend timed out — falling back to in-browser model.");
+    return null;
+  }
+
+  /**
+   * Convert raw backend segment dicts into the same format used by
+   * predetectFromCaptions() so Stage 2 polling can consume them.
+   */
+  function _backendSegmentsToPredetected(rawSegments) {
+    return rawSegments.map(s => ({
+      start:  s.start,
+      end:    s.end,
+      score:  s.score,
+      source: "backend",
+    }));
   }
 
   // ─── Utilities ───────────────────────────────────────────────────────────

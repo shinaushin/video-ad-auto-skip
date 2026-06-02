@@ -4,6 +4,9 @@
   "version": "1.0.0",
   "description": "Detects in-video sponsor segments using a bimodal ML model (keyword feature vector + MFCC audio). Experimental — runs alongside or instead of the Sponsor Speeder.",
   "permissions": [],
+  "host_permissions": [
+    "https://*.run.app/*"
+  ],
   "content_scripts": [
     {
       "matches": [

@@ -1,0 +1,18 @@
+# FastAPI server
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+
+# ML / inference
+torch>=2.1.0
+transformers>=4.35.0
+librosa>=0.10.0
+soundfile>=0.12.1
+
+# Data pipeline
+yt-dlp>=2024.1.0
+numpy>=1.24.0
+
+# GCP
+google-cloud-firestore>=2.14.0
+google-cloud-storage>=2.14.0
