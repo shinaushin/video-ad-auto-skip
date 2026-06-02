@@ -204,16 +204,27 @@ class StudentWindowDataset(Dataset):
         sponsor_ds: SponsorDataset,
         teacher_logits: dict[tuple[str, int], float] | None = None,
     ) -> None:
-        self._items: list[dict] = list(sponsor_ds)
         self._teacher_logits = teacher_logits or {}
-        # Pre-index items by (video_id, window_idx) for teacher logit / context lookup.
-        self._keys: list[tuple[str, int]] = []
+
+        # Build index first, then filter out label=-1 windows (isolated sponsors
+        # silenced by temporal consistency filtering).  These corrupt the
+        # WeightedRandomSampler class counts and provide no training signal.
+        all_items: list[dict] = list(sponsor_ds)
+        all_keys:  list[tuple[str, int]] = []
         vid_counter: dict[str, int] = {}
-        for item in self._items:
+        for item in all_items:
             vid = item["video_id"]
             idx = vid_counter.get(vid, 0)
-            self._keys.append((vid, idx))
+            all_keys.append((vid, idx))
             vid_counter[vid] = idx + 1
+
+        self._items: list[dict] = []
+        self._keys:  list[tuple[str, int]] = []
+        for item, key in zip(all_items, all_keys):
+            if item["label"] != -1:
+                self._items.append(item)
+                self._keys.append(key)
+
         # Total window count per video (for position normalisation).
         self._vid_total: dict[str, int] = vid_counter
 
@@ -797,20 +808,18 @@ def _run_student_epoch(
             position_input = position_input.to(device)  # [B, 1]
             vote_weight    = vote_weight.to(device)     # [B]
 
-            # Skip windows silenced by temporal consistency filtering (label=-1).
-            mask = hard_label >= 0
-            if mask.sum() == 0:
-                continue
+            # label=-1 windows are filtered out in StudentWindowDataset.__init__
+            # so every item in a student batch has a valid label (0 or 1).
             student_logit = model(
-                keyword_vec[mask], mfcc[mask], context_input[mask], position_input[mask]
+                keyword_vec, mfcc, context_input, position_input
             ).squeeze(-1)
 
             loss = kd_loss(
-                student_logit, teacher_logit[mask], hard_label[mask],
+                student_logit, teacher_logit, hard_label,
                 temperature=kd_temp,
                 alpha=kd_alpha,
                 focal=focal,
-                sample_weights=vote_weight[mask],
+                sample_weights=vote_weight,
             )
 
             if train and optimizer is not None:

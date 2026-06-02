@@ -180,15 +180,36 @@ class StudentWindowDataset(Dataset):
         sponsor_ds: SponsorDataset,
         teacher_logits: dict[tuple[str, int], float] | None = None,
     ) -> None:
-        self._items: list[dict] = list(sponsor_ds)
-        self._teacher_logits    = teacher_logits or {}
-        self._keys: list[tuple[str, int]] = []
+        self._teacher_logits = teacher_logits or {}
+
+        # Build the index first (needed to look up teacher logits by key),
+        # then filter out label=-1 windows (isolated sponsors silenced by
+        # temporal consistency filtering).  These provide no training signal
+        # for the student and corrupt the WeightedRandomSampler class counts.
+        all_items: list[dict] = list(sponsor_ds)
+        all_keys: list[tuple[str, int]] = []
         vid_counter: dict[str, int] = {}
-        for item in self._items:
+        for item in all_items:
             vid = item["video_id"]
             idx = vid_counter.get(vid, 0)
-            self._keys.append((vid, idx))
+            all_keys.append((vid, idx))
             vid_counter[vid] = idx + 1
+
+        n_before = len(all_items)
+        self._items: list[dict] = []
+        self._keys:  list[tuple[str, int]] = []
+        for item, key in zip(all_items, all_keys):
+            if item["label"] != -1:
+                self._items.append(item)
+                self._keys.append(key)
+        n_filtered = n_before - len(self._items)
+        if n_filtered:
+            log.info(
+                "StudentWindowDataset: dropped %d label=-1 windows (%.1f%% of total); "
+                "these were isolated sponsor windows silenced by temporal consistency filtering.",
+                n_filtered, 100.0 * n_filtered / max(n_before, 1),
+            )
+
         self._vid_total: dict[str, int] = vid_counter
 
     def __len__(self) -> int:
@@ -663,23 +684,20 @@ class StudentLightningModule(L.LightningModule):
         self, batch: tuple
     ) -> tuple[torch.Tensor, list[float], list[int]]:
         keyword_vec, mfcc, hard_label, teacher_logit, context_input, position_input, vote_weight = batch
-        # Skip windows silenced by temporal consistency filtering (label=-1).
-        mask           = hard_label >= 0
-        if mask.sum() == 0:
-            dummy = torch.tensor(0.0, requires_grad=True, device=hard_label.device)
-            return dummy, [], []
-        student_logit  = self.model(
-            keyword_vec[mask], mfcc[mask], context_input[mask], position_input[mask]
+        # label=-1 windows are filtered out in StudentWindowDataset.__init__
+        # so every item in a student batch has a valid label (0 or 1).
+        student_logit = self.model(
+            keyword_vec, mfcc, context_input, position_input
         ).squeeze(-1)
         loss = kd_loss(
-            student_logit, teacher_logit[mask], hard_label[mask],
+            student_logit, teacher_logit, hard_label,
             temperature    = self.kd_temp,
             alpha          = self.kd_alpha,
             focal          = self.focal,
-            sample_weights = vote_weight[mask],
+            sample_weights = vote_weight,
         )
         probs  = torch.sigmoid(student_logit).detach().cpu().tolist()
-        labels = hard_label[mask].long().cpu().tolist()
+        labels = hard_label.long().cpu().tolist()
         return loss, probs, labels
 
     # ── Training ──────────────────────────────────────────────────────────
